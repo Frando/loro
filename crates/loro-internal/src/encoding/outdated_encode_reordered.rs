@@ -56,6 +56,14 @@ pub(crate) fn import_changes_to_oplog(
             continue;
         }
 
+        // A change that starts past its peer's held counter waits for the gap
+        // to fill, like a change with missing deps. Inserting it would break
+        // the counter continuity of the DAG and of the version vector.
+        if change.id.counter > oplog.vv().get(&change.id.peer).copied().unwrap_or(0) {
+            pending_changes.push(change);
+            continue;
+        }
+
         latest_ids.push(change.id_last());
         // calc lamport or pending if its deps are not satisfied
         match oplog.dag.get_change_lamport_from_deps(&change.deps) {
