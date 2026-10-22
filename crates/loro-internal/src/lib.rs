@@ -60,6 +60,7 @@ pub mod jsonpath;
 pub mod kv_store;
 pub mod loro;
 pub mod op;
+pub mod op_view;
 pub mod oplog;
 pub mod subscription;
 pub mod txn;
