@@ -385,15 +385,24 @@ impl AppDag {
     }
 
     /// If the lamport of change can be calculated, return Ok, otherwise, Err
+    ///
+    /// The lamport comes from the deps only, as for a change whose deps are
+    /// present on import (`get_change_lamport_from_deps`). The lamport that a
+    /// parked change carried on the wire is not a lower bound: otherwise a
+    /// sender could raise it by ordering the change before its deps, and
+    /// replicas that import the same changes in another order would compute
+    /// other lamports and resolve conflicts differently.
     pub(crate) fn calc_unknown_lamport_change(&self, change: &mut Change) -> Result<(), ()> {
+        let mut lamport = 0;
         for dep in change.deps.iter() {
             match self.get_lamport(&dep) {
-                Some(lamport) => {
-                    change.lamport = change.lamport.max(lamport + 1);
+                Some(dep_lamport) => {
+                    lamport = lamport.max(dep_lamport + 1);
                 }
                 None => return Err(()),
             }
         }
+        change.lamport = lamport;
         Ok(())
     }
 
