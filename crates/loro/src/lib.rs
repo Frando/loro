@@ -10,6 +10,7 @@ use loro_internal::cursor::Cursor;
 use loro_internal::cursor::PosQueryResult;
 use loro_internal::cursor::Side;
 pub use loro_internal::encoding::ImportStatus;
+pub use loro_internal::encoding::{ImportBudget, IMPORT_BUDGET_EXCEEDED};
 use loro_internal::handler::{HandlerTrait, ValueOrHandler};
 pub use loro_internal::loro::ChangeTravelError;
 pub use loro_internal::pre_commit::{
@@ -204,6 +205,18 @@ impl LoroDoc {
         check_checksum: bool,
     ) -> LoroResult<ImportBlobMetadata> {
         InnerLoroDoc::decode_import_blob_meta(bytes, check_checksum)
+    }
+
+    /// [`LoroDoc::decode_import_blob_meta`] for untrusted bytes: every count
+    /// the blob claims is checked against `budget` before it sizes an
+    /// allocation, as in [`LoroDoc::import_with_budget`].
+    #[inline]
+    pub fn decode_import_blob_meta_with_budget(
+        bytes: &[u8],
+        check_checksum: bool,
+        budget: ImportBudget,
+    ) -> LoroResult<ImportBlobMetadata> {
+        InnerLoroDoc::decode_import_blob_meta_with_budget(bytes, check_checksum, budget)
     }
 
     /// Set whether to record the timestamp of each change. Default is `false`.
@@ -720,6 +733,46 @@ impl LoroDoc {
     #[inline]
     pub fn import_with(&self, bytes: &[u8], origin: &str) -> Result<ImportStatus, LoroError> {
         self.doc.import_with(bytes, origin.into())
+    }
+
+    /// Import untrusted bytes, with every count they claim checked against
+    /// `budget` before it sizes an allocation.
+    ///
+    /// A crafted blob can claim huge counts in a few bytes; [`LoroDoc::import`]
+    /// may then run out of memory and abort the process. With a budget, such
+    /// a blob fails with [`LoroError::DecodeError`] (its message starts with
+    /// [`IMPORT_BUDGET_EXCEEDED`]) and the document stays as it was. For honest
+    /// bytes within the budget the result is the same as [`LoroDoc::import`].
+    ///
+    /// The budget covers fast updates and fast snapshots: their change blocks
+    /// and the LZ4 output of a snapshot's change store and state. A snapshot's
+    /// state section is decoded lazily later and is not covered beyond its
+    /// LZ4 output. Shallow snapshots and the outdated encodings are refused.
+    ///
+    /// # Example
+    /// ```
+    /// use loro::{ExportMode, ImportBudget, LoroDoc};
+    ///
+    /// let a = LoroDoc::new();
+    /// a.get_text("text").insert(0, "Hello").unwrap();
+    /// let updates = a.export(ExportMode::all_updates()).unwrap();
+    ///
+    /// let b = LoroDoc::new();
+    /// let budget = ImportBudget { changes: 1, ops: 5, decompressed_bytes: 1 << 20 };
+    /// b.import_with_budget(&updates, budget).unwrap();
+    /// assert_eq!(a.get_deep_value(), b.get_deep_value());
+    ///
+    /// let c = LoroDoc::new();
+    /// let budget = ImportBudget { changes: 1, ops: 4, decompressed_bytes: 1 << 20 };
+    /// assert!(c.import_with_budget(&updates, budget).is_err());
+    /// ```
+    #[inline]
+    pub fn import_with_budget(
+        &self,
+        bytes: &[u8],
+        budget: ImportBudget,
+    ) -> Result<ImportStatus, LoroError> {
+        self.doc.import_with_budget(bytes, budget)
     }
 
     /// Import the json schema updates.

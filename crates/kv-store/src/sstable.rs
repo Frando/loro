@@ -1,7 +1,7 @@
 use super::block::BlockIter;
 use crate::{
     block::{Block, BlockBuilder},
-    compress::CompressionType,
+    compress::{decompress_with_limit, CompressionType},
     iter::KvIterator,
     utils::{get_u16_le, get_u32_le, get_u8_le},
 };
@@ -396,11 +396,9 @@ impl SsTable {
         Self::import_all_with(bytes, false, false)
     }
 
-    fn import_all_with(
-        bytes: Bytes,
-        validate_blocks: bool,
-        check_checksum: bool,
-    ) -> LoroResult<Self> {
+    /// Parses the header and the block meta of SsTable bytes and checks the
+    /// block ranges. Returns the block meta and the meta offset.
+    fn parse_meta(bytes: &Bytes) -> LoroResult<(Vec<BlockMeta>, usize)> {
         // magic number + schema version + meta offset
         if bytes.len() < SIZE_OF_U32 + SIZE_OF_U8 + SIZE_OF_U32 {
             return Err(LoroError::DecodeError("Invalid sstable bytes".into()));
@@ -429,6 +427,42 @@ impl SsTable {
         let raw_meta = &bytes[meta_offset..data_len - SIZE_OF_U32];
         let meta = BlockMeta::decode_meta(raw_meta)?;
         Self::validate_block_ranges(&meta, meta_offset)?;
+        Ok((meta, meta_offset))
+    }
+
+    /// Returns the total size of the blocks of SsTable `bytes` after
+    /// decompression, without keeping them, or `None` as soon as that size
+    /// would pass `limit`.
+    ///
+    /// Each block is decompressed with [`decompress_with_limit`], so a block
+    /// that claims a huge output (an LZ4 bomb) is refused after about `limit`
+    /// bytes. Callers that import untrusted bytes under a memory budget call
+    /// this before [`Self::import_all`]; the blocks are later decompressed
+    /// lazily and never produce more than this total.
+    pub fn decompressed_size(bytes: &Bytes, limit: usize) -> LoroResult<Option<usize>> {
+        let (meta, meta_offset) = Self::parse_meta(bytes)?;
+        let mut total = 0usize;
+        let mut buf = Vec::new();
+        for i in 0..meta.len() {
+            let offset = meta[i].offset;
+            let offset_end = meta.get(i + 1).map_or(meta_offset, |m| m.offset);
+            // `parse_meta` checked that every block holds at least its checksum.
+            let body = bytes.slice(offset..offset_end - SIZE_OF_U32);
+            buf.clear();
+            match decompress_with_limit(&mut buf, body, meta[i].compression_type, limit - total)? {
+                Some(len) => total += len,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(total))
+    }
+
+    fn import_all_with(
+        bytes: Bytes,
+        validate_blocks: bool,
+        check_checksum: bool,
+    ) -> LoroResult<Self> {
+        let (meta, meta_offset) = Self::parse_meta(&bytes)?;
         if validate_blocks {
             Self::validate_blocks(&meta, &bytes, meta_offset)?;
         }

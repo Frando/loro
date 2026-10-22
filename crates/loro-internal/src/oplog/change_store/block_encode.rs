@@ -77,7 +77,7 @@ use loro_common::{
 use once_cell::sync::OnceCell;
 use rle::HasLength;
 use serde::{Deserialize, Serialize};
-use serde_columnar::{columnar, AnyRleDecoder, DeltaOfDeltaDecoder, Itertools};
+use serde_columnar::{columnar, AnyRleDecoder, ColumnarError, DeltaOfDeltaDecoder, Itertools};
 use tracing::info;
 
 use super::block_meta_encode::decode_changes_header;
@@ -87,9 +87,10 @@ use crate::container::tree::tree_op;
 use crate::encoding::arena::{ContainerArena, PositionArena};
 use crate::encoding::value_register::ValueRegister;
 use crate::encoding::{
-    self, decode_op, encode_op, get_op_prop, EncodedDeleteStartId, IterableEncodedDeleteStartId,
+    self, decode_op, encode_op, get_op_prop, EncodedDeleteStartId, ImportBudget,
+    IterableEncodedDeleteStartId,
 };
-use crate::op::Op;
+use crate::op::{InnerContent, Op};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EncodedBlock<'a> {
@@ -537,8 +538,31 @@ pub fn decode_block(
     shared_arena: &SharedArena,
     header: Option<&ChangesBlockHeader>,
 ) -> LoroResult<Vec<Change>> {
-    let doc = postcard::from_bytes(m_bytes)
+    decode_block_with_budget(m_bytes, shared_arena, header, None)
+}
+
+/// [`decode_block`], with the block's counts checked against `budget` when
+/// there is one.
+///
+/// Under a budget, the block's change count and length in atoms are taken
+/// from the budget before anything is decoded. The columns that run length
+/// encoding can expand are decoded lazily: ops and positions are refused
+/// once there are more of them than the block has atoms (an honest block
+/// has at most one op per atom and one position per op), and delete starts
+/// are decoded one at a time as delete ops use them. Decoded fractional
+/// indexes count against `decompressed_bytes`.
+pub(crate) fn decode_block_with_budget(
+    m_bytes: &[u8],
+    shared_arena: &SharedArena,
+    header: Option<&ChangesBlockHeader>,
+    mut budget: Option<&mut ImportBudget>,
+) -> LoroResult<Vec<Change>> {
+    let doc: EncodedBlock = postcard::from_bytes(m_bytes)
         .map_err(|e| LoroError::DecodeError(format!("Decode block error {e}").into_boxed_str()))?;
+    let max_column_len = doc.counter_len as usize;
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.charge_block(doc.n_changes as usize, max_column_len)?;
+    }
     let header_on_stack;
     let header = if let Some(header) = header {
         header
@@ -559,6 +583,11 @@ pub fn decode_block(
         ..
     } = doc;
     let n_changes = n_changes as usize;
+    // The header was decoded from these bytes, which bounds its change count
+    // by the header's length; the allocations below rely on that.
+    if n_changes != header.n_changes {
+        return Err(LoroError::DecodeDataCorruptionError);
+    }
     let mut changes = Vec::with_capacity(n_changes);
     let timestamp_decoder = DeltaOfDeltaDecoder::<i64>::new(&change_meta)
         .map_err(|_| LoroError::DecodeDataCorruptionError)?;
@@ -575,8 +604,13 @@ pub fn decode_block(
         peers: &header.peers,
         keys,
     };
-    let positions = PositionArena::decode_v2(&positions)?;
-    let positions = positions.try_parse_to_positions()?;
+    let positions = match budget.as_deref_mut() {
+        None => PositionArena::decode_v2(&positions)?.try_parse_to_positions()?,
+        Some(budget) => PositionArena::decode_v2_capped(&positions, max_column_len)?
+            .try_parse_to_positions_with_budget(budget)?,
+    };
+    // The container arena is a plain sequence of rows (not run length
+    // encoded), so its length is bounded by its bytes.
     let cids: &Vec<ContainerID> = header.cids.get_or_try_init(|| {
         ContainerArena::decode(&cids)?
             .iter()
@@ -586,17 +620,20 @@ pub fn decode_block(
     let mut value_reader = ValueReader::new(&values);
     let encoded_ops_iters = serde_columnar::iter_from_bytes::<EncodedOps>(&ops)?;
     let op_iter = encoded_ops_iters.ops;
-    let encoded_delete_id_starts: EncodedDeleteStartIds = if delete_start_ids.is_empty() {
-        EncodedDeleteStartIds {
-            delete_start_ids: Vec::new(),
-        }
-    } else {
-        serde_columnar::from_bytes(&delete_start_ids)?
-    };
-    let mut del_iter = encoded_delete_id_starts
-        .delete_start_ids
-        .into_iter()
-        .map(Ok);
+    let mut del_iter: Box<dyn Iterator<Item = Result<EncodedDeleteStartId, ColumnarError>>> =
+        if delete_start_ids.is_empty() {
+            Box::new(std::iter::empty())
+        } else if budget.is_some() {
+            // Decoded one by one as delete ops need them, so a run length
+            // encoded column never expands past the ops of the block.
+            Box::new(
+                serde_columnar::iter_from_bytes::<EncodedDeleteStartIds>(&delete_start_ids)?
+                    .delete_start_ids,
+            )
+        } else {
+            let decoded: EncodedDeleteStartIds = serde_columnar::from_bytes(&delete_start_ids)?;
+            Box::new(decoded.delete_start_ids.into_iter().map(Ok))
+        };
     for i in 0..n_changes {
         let commit_msg: Option<Arc<str>> = {
             let len = *commit_msg_lens
@@ -651,6 +688,7 @@ pub fn decode_block(
     let mut counter = first_counter as Counter;
     let mut change_index = 0;
     let peer = header.peer;
+    let mut n_ops = 0usize;
     for op in op_iter {
         let EncodedOp {
             container_index,
@@ -658,6 +696,14 @@ pub fn decode_block(
             value_type,
             len,
         } = op?;
+        if budget.is_some() {
+            n_ops += 1;
+            if n_ops > max_column_len {
+                return Err(LoroError::DecodeError(
+                    "Decode block error: more ops than atoms".into(),
+                ));
+            }
+        }
         let value = Value::decode(
             ValueKind::from_u8(value_type),
             &mut value_reader,
@@ -678,6 +724,13 @@ pub fn decode_block(
             prop,
             ID::new(peer, counter),
         )?;
+        if let (Some(budget), InnerContent::Tree(tree_op)) = (budget.as_deref_mut(), &content) {
+            if let tree_op::TreeOp::Create { position, .. }
+            | tree_op::TreeOp::Move { position, .. } = tree_op.as_ref()
+            {
+                budget.charge_decompressed(position.as_bytes().len())?;
+            }
+        }
 
         let c_idx = shared_arena.register_container(cid);
         let op = Op {
@@ -712,9 +765,180 @@ mod test {
     use loro_common::ContainerType;
 
     use crate::encoding::value::{EncodedTreeMove, Value};
+    use crate::encoding::IMPORT_BUDGET_EXCEEDED;
     use crate::{cursor::PosType, delta::DeltaValue, loro::ExportMode, LoroDoc};
+    use serde_columnar::{AnyRleEncoder, BoolRleEncoder};
 
     use super::*;
+
+    /// The bytes of the one change block of `doc`, a document of one peer.
+    fn only_block(doc: &LoroDoc) -> Vec<u8> {
+        let oplog = doc.oplog.lock();
+        let mut changes = Vec::new();
+        oplog
+            .change_store()
+            .visit_all_changes(&mut |change| changes.push(change.clone()));
+        encode_block(&changes, &oplog.arena)
+    }
+
+    /// A block of one change with two map sets.
+    fn map_block() -> Vec<u8> {
+        let doc = LoroDoc::new_auto_commit();
+        doc.set_peer_id(1).unwrap();
+        doc.get_map("map").insert("x", 1).unwrap();
+        doc.get_map("map").insert("y", 2).unwrap();
+        doc.commit_then_renew();
+        only_block(&doc)
+    }
+
+    /// `block` with `f` applied to its fields.
+    fn craft(block: &[u8], f: impl FnOnce(&mut EncodedBlock<'_>)) -> Vec<u8> {
+        let mut encoded: EncodedBlock = postcard::from_bytes(block).unwrap();
+        f(&mut encoded);
+        postcard::to_allocvec(&encoded).unwrap()
+    }
+
+    /// A fast update blob with `block` as its only block.
+    fn update_blob(block: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        leb128::write::unsigned(&mut body, block.len() as u64).unwrap();
+        body.extend_from_slice(block);
+        crate::encoding::encode_blob_for_test(crate::encoding::EncodeMode::FastUpdates, &body)
+    }
+
+    fn small_budget() -> ImportBudget {
+        ImportBudget {
+            changes: 100,
+            ops: 100,
+            decompressed_bytes: 1 << 20,
+        }
+    }
+
+    /// `table`, a columnar table of one row whose columns are all run length
+    /// encoded, with that row repeated `n` times: each column's run count
+    /// becomes `n`. A few bytes that decode to `n` rows.
+    fn repeat_rows(table: &[u8], n: u64) -> Vec<u8> {
+        let mut r = table;
+        let mut ans = Vec::new();
+        // The field count of the table struct and the column count.
+        let fields = leb128::read::unsigned(&mut r).unwrap();
+        assert_eq!(fields, 1);
+        let columns = leb128::read::unsigned(&mut r).unwrap();
+        leb128::write::unsigned(&mut ans, fields).unwrap();
+        leb128::write::unsigned(&mut ans, columns).unwrap();
+        for _ in 0..columns {
+            let len = leb128::read::unsigned(&mut r).unwrap() as usize;
+            let (mut column, rest) = r.split_at(len);
+            r = rest;
+            // One row: a zigzag encoded count of 1 (a run) or -1 (a literal
+            // run), then the value. A run of n repeats the same value.
+            let count = leb128::read::unsigned(&mut column).unwrap();
+            assert!(count == 2 || count == 1, "one row, not {count}");
+            let mut new_column = Vec::new();
+            leb128::write::unsigned(&mut new_column, n * 2).unwrap();
+            new_column.extend_from_slice(column);
+            leb128::write::unsigned(&mut ans, new_column.len() as u64).unwrap();
+            ans.extend_from_slice(&new_column);
+        }
+        assert!(r.is_empty());
+        ans
+    }
+
+    #[test]
+    fn crafted_blocks_import_when_unchanged() {
+        let block = map_block();
+        let doc = LoroDoc::new();
+        doc.import_with_budget(&update_blob(&craft(&block, |_| {})), small_budget())
+            .unwrap();
+        assert_eq!(doc.oplog_vv().get(&1), Some(&2));
+    }
+
+    #[test]
+    fn a_huge_change_count_is_refused_before_it_sizes_allocations() {
+        let crafted = craft(&map_block(), |b| b.n_changes = u32::MAX);
+        let arena = SharedArena::new();
+        assert!(decode_block(&crafted, &arena, None).is_err());
+        assert!(decode_header(&crafted).is_err());
+        let blob = update_blob(&crafted);
+        let err = LoroDoc::new()
+            .import_with_budget(&blob, small_budget())
+            .unwrap_err();
+        assert!(err.to_string().contains(IMPORT_BUDGET_EXCEEDED), "{err}");
+        assert!(LoroDoc::new().import(&blob).is_err());
+    }
+
+    #[test]
+    fn a_huge_dep_count_is_refused_before_it_sizes_allocations() {
+        let crafted = craft(&map_block(), |b| {
+            let mut header = Vec::new();
+            leb128::write::unsigned(&mut header, 1).unwrap();
+            header.extend_from_slice(&1u64.to_le_bytes());
+            let mut dep_self = BoolRleEncoder::new();
+            dep_self.append(false).unwrap();
+            header.extend(dep_self.finish().unwrap());
+            let mut dep_len = AnyRleEncoder::<usize>::new();
+            dep_len.append(1 << 40).unwrap();
+            header.extend(dep_len.finish().unwrap());
+            header.extend_from_slice(&[0; 16]);
+            b.header = Cow::Owned(header);
+        });
+        let arena = SharedArena::new();
+        assert!(decode_header(&crafted).is_err());
+        assert!(decode_block(&crafted, &arena, None).is_err());
+        let blob = update_blob(&crafted);
+        assert!(LoroDoc::new()
+            .import_with_budget(&blob, small_budget())
+            .is_err());
+        assert!(LoroDoc::new().import(&blob).is_err());
+    }
+
+    /// An ops column that run length encoding expands to 10^8 ops of length
+    /// 0 is refused under a budget after one op more than the block's atoms.
+    #[test]
+    fn ops_past_the_atoms_are_refused_under_a_budget() {
+        let one = serde_columnar::to_vec(&EncodedOps {
+            ops: vec![EncodedOp {
+                container_index: 0,
+                prop: 0,
+                value_type: 8, // DeleteOnce, a map delete
+                len: 0,
+            }],
+        })
+        .unwrap();
+        let ops = repeat_rows(&one, 100_000_000);
+        let iter = serde_columnar::iter_from_bytes::<EncodedOps>(&ops).unwrap();
+        assert_eq!(iter.ops.take(1000).count(), 1000, "the column expands");
+        let crafted = craft(&map_block(), |b| b.ops = Cow::Owned(ops));
+        let arena = SharedArena::new();
+        let mut budget = small_budget();
+        let err = decode_block_with_budget(&crafted, &arena, None, Some(&mut budget)).unwrap_err();
+        assert!(err.to_string().contains("more ops than atoms"), "{err}");
+        assert!(LoroDoc::new()
+            .import_with_budget(&update_blob(&crafted), small_budget())
+            .is_err());
+    }
+
+    /// A delete start column that expands to 10^8 entries is read one entry
+    /// per delete op under a budget, so the block decodes as before.
+    #[test]
+    fn delete_starts_are_decoded_lazily_under_a_budget() {
+        let doc = LoroDoc::new_auto_commit();
+        doc.set_peer_id(1).unwrap();
+        let text = doc.get_text("text");
+        text.insert(0, "hello", crate::cursor::PosType::Unicode)
+            .unwrap();
+        text.delete(1, 2, crate::cursor::PosType::Unicode).unwrap();
+        doc.commit_then_renew();
+        let block = only_block(&doc);
+        let encoded: EncodedBlock = postcard::from_bytes(&block).unwrap();
+        let starts = repeat_rows(&encoded.delete_start_ids, 100_000_000);
+        let crafted = craft(&block, |b| b.delete_start_ids = Cow::Owned(starts));
+        let target = LoroDoc::new();
+        target
+            .import_with_budget(&update_blob(&crafted), small_budget())
+            .unwrap();
+        assert_eq!(target.get_deep_value(), doc.get_deep_value());
+    }
 
     #[test]
     fn decode_block_rejects_corrupt_payload_without_panic() {

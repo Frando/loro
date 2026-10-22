@@ -1,11 +1,13 @@
 use self::block_encode::{
-    decode_block, decode_cids, decode_header, encode_block, ChangesBlockHeader,
+    decode_block, decode_block_with_budget, decode_cids, decode_header, encode_block,
+    ChangesBlockHeader,
 };
 use super::{loro_dag::AppDagNodeInner, AppDagNode};
 use crate::sync::Mutex;
 use crate::{
     arena::SharedArena,
     change::Change,
+    encoding::ImportBudget,
     estimated_size::EstimatedSize,
     kv_store::KvStore,
     op::Op,
@@ -306,9 +308,10 @@ impl ChangeStore {
         bytes: Bytes,
         arena: &SharedArena,
         self_vv: &VersionVector,
+        budget: Option<&mut ImportBudget>,
     ) -> Result<Vec<Change>, LoroError> {
         let change_store = ChangeStore::new_mem(arena, Arc::new(AtomicI64::new(0)));
-        let _ = change_store.import_all(bytes)?;
+        let _ = change_store.import_all_with_budget(bytes, budget)?;
         let mut changes = Vec::new();
         change_store.visit_all_changes(&mut |c| {
             let cnt_threshold = self_vv.get(&c.id.peer).copied().unwrap_or(0);
@@ -330,8 +333,13 @@ impl ChangeStore {
         bytes: Bytes,
         arena: &SharedArena,
         self_vv: &VersionVector,
+        budget: Option<&mut ImportBudget>,
     ) -> LoroResult<Vec<Change>> {
-        let mut ans = ChangesBlockBytes::new(bytes).parse(arena)?;
+        let block = ChangesBlockBytes::new(bytes);
+        let mut ans = match budget {
+            None => block.parse(arena)?,
+            Some(budget) => block.parse_with_budget(arena, budget)?,
+        };
         if ans.is_empty() {
             return Ok(ans);
         }
@@ -805,8 +813,28 @@ mod mut_external_kv {
     use super::*;
 
     impl ChangeStore {
-        #[tracing::instrument(skip_all, level = "debug", name = "change_store import_all")]
+        #[cfg(test)]
         pub(crate) fn import_all(&self, bytes: Bytes) -> Result<BatchDecodeInfo, LoroError> {
+            self.import_all_with_budget(bytes, None)
+        }
+
+        /// Imports the serialized change store of a snapshot into this empty
+        /// store, with the bytes checked against `budget` when there is one.
+        ///
+        /// Under a budget, the compressed blocks are decompressed once, with
+        /// their total output bounded by the budget, before the store keeps
+        /// them, and every change block is decoded once against the budget
+        /// before anything reads it. Later lazy reads decode the same bytes
+        /// and so stay within the same bounds.
+        #[tracing::instrument(skip_all, level = "debug", name = "change_store import_all")]
+        pub(crate) fn import_all_with_budget(
+            &self,
+            bytes: Bytes,
+            mut budget: Option<&mut ImportBudget>,
+        ) -> Result<BatchDecodeInfo, LoroError> {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.charge_kv_bytes(&bytes)?;
+            }
             let mut kv_store = self.external_kv.lock();
             assert!(
                 // 2 because there are vv and frontiers
@@ -819,6 +847,15 @@ mod mut_external_kv {
             kv_store
                 .import_all(bytes)
                 .map_err(|e| LoroError::DecodeError(e.into_boxed_str()))?;
+            if let Some(budget) = budget {
+                for (key, block) in kv_store.scan(Bound::Unbounded, Bound::Unbounded) {
+                    // Change blocks are keyed by the 12 bytes of their first ID; the
+                    // other keys hold version metadata.
+                    if key.len() == 12 {
+                        decode_block_with_budget(&block, &self.arena, None, Some(&mut *budget))?;
+                    }
+                }
+            }
             drop(kv_store);
             *self.root_history_names.lock() = RootHistoryNamesState::Uninitialized;
             let vv_bytes = self.external_kv.lock().get(VV_KEY).unwrap_or_default();
@@ -1916,6 +1953,22 @@ impl ChangesBlockBytes {
         let ans: Vec<Change> = decode_block(&self.bytes, a, self.header.get().map(|h| h.as_ref()))?;
         for c in ans.iter() {
             // PERF: This can be made faster (low priority)
+            register_container_and_parent_link(a, c)
+        }
+
+        Ok(ans)
+    }
+
+    /// [`Self::parse`] with the block's counts checked against `budget`
+    /// before they size allocations. The header is decoded after the
+    /// budget is charged, and not cached.
+    fn parse_with_budget(
+        &self,
+        a: &SharedArena,
+        budget: &mut ImportBudget,
+    ) -> LoroResult<Vec<Change>> {
+        let ans: Vec<Change> = decode_block_with_budget(&self.bytes, a, None, Some(budget))?;
+        for c in ans.iter() {
             register_container_and_parent_link(a, c)
         }
 

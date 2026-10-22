@@ -129,6 +129,13 @@ pub(crate) fn decode_changes_header(
     // │ LEB First Counter │         N LEB128 Change AtomLen          │◁───┼─────  Important metadata
     // └───────────────────┴──────────────────────────────────────────┘    │
 
+    // Each of the n - 1 lengths takes at least one byte, so a larger claim is
+    // refused before it sizes the allocations below.
+    if n_changes - 1 > bytes.len() {
+        return Err(LoroError::DecodeError(
+            "Decode block error: invalid change count".into(),
+        ));
+    }
     let mut lengths = Vec::with_capacity(n_changes);
     for _ in 0..n_changes - 1 {
         lengths.push(leb128::read::unsigned(&mut bytes).map_err(|e| {
@@ -156,7 +163,19 @@ pub(crate) fn decode_changes_header(
     let (deps_len, bytes) = dep_len_decoder
         .take_n_finalize(n_changes)
         .map_err(|_| LoroError::DecodeError("Decode block error: invalid deps".into()))?;
-    let other_dep_num = deps_len.iter().sum::<usize>();
+    let other_dep_num = deps_len
+        .iter()
+        .try_fold(0usize, |acc, len| acc.checked_add(*len))
+        .ok_or_else(|| LoroError::DecodeError("Decode block error: invalid deps".into()))?;
+    // The dep counters below are delta-of-delta encoded in these bytes: a
+    // head value, a byte with the number of used bits, and at least one bit
+    // per further value. A larger claim cannot decode, so it is refused
+    // before it sizes the two allocations of `take_n_finalize`.
+    if other_dep_num > bytes.len().saturating_mul(8).saturating_add(256) {
+        return Err(LoroError::DecodeError(
+            "Decode block error: invalid deps".into(),
+        ));
+    }
     let dep_peer_decoder = AnyRleDecoder::<usize>::new(bytes);
     let (dep_peers, bytes) = dep_peer_decoder
         .take_n_finalize(other_dep_num)

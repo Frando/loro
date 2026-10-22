@@ -224,6 +224,101 @@ impl TryFrom<[u8; 2]> for EncodeMode {
     }
 }
 
+/// Limits on what untrusted bytes may decode to, for
+/// [`LoroDoc::import_with_budget`].
+///
+/// A crafted blob can claim huge counts in a few bytes: a block's change
+/// count, run-length encoded columns, LZ4 frames. Plain [`LoroDoc::import`]
+/// sizes some allocations by those claims, so a small blob can make the
+/// process run out of memory and abort. Under a budget, every such count is
+/// checked against what is left of the budget before it sizes an
+/// allocation, and the import fails with [`LoroError::DecodeError`] (its
+/// message starts with [`IMPORT_BUDGET_EXCEEDED`]) before it changes the
+/// document.
+///
+/// The budget covers one import call, summed over all of its change blocks.
+/// Callers derive it from what they expect to receive, for example from the
+/// version they are about to sync to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportBudget {
+    /// The most changes the blob may contain.
+    pub changes: usize,
+    /// The most ops the blob may contain, counted in atoms (counter units):
+    /// a text insert of 5 characters counts 5.
+    pub ops: usize,
+    /// The most bytes the blob may expand to while it is decoded: the output
+    /// of its compressed blocks (the change store and the state of a
+    /// snapshot), and the fractional indexes of tree ops, which are
+    /// prefix-compressed in the encoding.
+    pub decompressed_bytes: usize,
+}
+
+/// The start of the message of the [`LoroError::DecodeError`] that an
+/// import returns when it exceeds its [`ImportBudget`].
+pub const IMPORT_BUDGET_EXCEEDED: &str = "import budget exceeded";
+
+impl ImportBudget {
+    /// A budget that never runs out.
+    pub const fn unlimited() -> Self {
+        Self {
+            changes: usize::MAX,
+            ops: usize::MAX,
+            decompressed_bytes: usize::MAX,
+        }
+    }
+
+    fn exceeded(what: &str, claimed: usize, left: usize) -> LoroError {
+        LoroError::DecodeError(
+            format!("{IMPORT_BUDGET_EXCEEDED}: {claimed} {what}, {left} left").into_boxed_str(),
+        )
+    }
+
+    /// Takes a change block's change count and its length in atoms from the
+    /// budget, before anything of the block is decoded.
+    pub(crate) fn charge_block(&mut self, n_changes: usize, atoms: usize) -> LoroResult<()> {
+        if n_changes > self.changes {
+            return Err(Self::exceeded("changes", n_changes, self.changes));
+        }
+        if atoms > self.ops {
+            return Err(Self::exceeded("ops", atoms, self.ops));
+        }
+        self.changes -= n_changes;
+        self.ops -= atoms;
+        Ok(())
+    }
+
+    /// Takes `len` decoded bytes from the budget.
+    pub(crate) fn charge_decompressed(&mut self, len: usize) -> LoroResult<()> {
+        if len > self.decompressed_bytes {
+            return Err(Self::exceeded(
+                "decompressed bytes",
+                len,
+                self.decompressed_bytes,
+            ));
+        }
+        self.decompressed_bytes -= len;
+        Ok(())
+    }
+
+    /// Takes the decompressed size of serialized KV store bytes (an SSTable,
+    /// usually with LZ4 blocks) from the budget. Decompression stops as soon
+    /// as the output would pass what is left.
+    pub(crate) fn charge_kv_bytes(&mut self, bytes: &bytes::Bytes) -> LoroResult<()> {
+        match loro_kv_store::MemKvStore::decompressed_size(bytes, self.decompressed_bytes)
+            .map_err(|e| LoroError::DecodeError(e.into_boxed_str()))?
+        {
+            Some(size) => self.charge_decompressed(size),
+            None => Err(LoroError::DecodeError(
+                format!(
+                    "{IMPORT_BUDGET_EXCEEDED}: compressed blocks expand past {} bytes",
+                    self.decompressed_bytes
+                )
+                .into_boxed_str(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ImportStatus {
     pub success: VersionRange,
@@ -248,13 +343,25 @@ pub(crate) fn decode_oplog_changes(
     oplog: &mut OpLog,
     parsed: ParsedHeaderAndBody,
 ) -> Result<Vec<Change>, LoroError> {
+    decode_oplog_changes_with_budget(oplog, parsed, None)
+}
+
+/// [`decode_oplog_changes`], with every decoded count checked against
+/// `budget` when there is one.
+pub(crate) fn decode_oplog_changes_with_budget(
+    oplog: &mut OpLog,
+    parsed: ParsedHeaderAndBody,
+    mut budget: Option<ImportBudget>,
+) -> Result<Vec<Change>, LoroError> {
     let ParsedHeaderAndBody { mode, body, .. } = parsed;
     match mode {
         EncodeMode::OutdatedRle | EncodeMode::OutdatedSnapshot => {
             Err(LoroError::ImportUnsupportedEncodingMode)
         }
-        EncodeMode::FastSnapshot => fast_snapshot::decode_oplog(oplog, body),
-        EncodeMode::FastUpdates => fast_snapshot::decode_updates(oplog, body.to_vec().into()),
+        EncodeMode::FastSnapshot => fast_snapshot::decode_oplog(oplog, body, budget.as_mut()),
+        EncodeMode::FastUpdates => {
+            fast_snapshot::decode_updates(oplog, body.to_vec().into(), budget.as_mut())
+        }
         EncodeMode::Auto => unreachable!(),
     }
 }
@@ -442,6 +549,17 @@ pub(crate) fn export_state_only_snapshot(
     })
 }
 
+/// Wraps `body` in the header of `mode`, with a valid checksum, so tests
+/// can import crafted bodies.
+#[cfg(test)]
+pub(crate) fn encode_blob_for_test(mode: EncodeMode, body: &[u8]) -> Vec<u8> {
+    encode_with(mode, &mut |ans| {
+        ans.extend_from_slice(body);
+        Ok(())
+    })
+    .unwrap()
+}
+
 fn encode_with(
     mode: EncodeMode,
     f: &mut dyn FnMut(&mut Vec<u8>) -> Result<(), LoroEncodeError>,
@@ -476,13 +594,14 @@ pub(crate) fn decode_snapshot(
     mode: EncodeMode,
     body: &[u8],
     origin: InternalString,
+    mut budget: Option<ImportBudget>,
 ) -> Result<ImportStatus, LoroError> {
     match mode {
         EncodeMode::OutdatedSnapshot => {
             return Err(LoroError::ImportUnsupportedEncodingMode);
         }
         EncodeMode::FastSnapshot => {
-            fast_snapshot::decode_snapshot(doc, body.to_vec().into(), origin)?
+            fast_snapshot::decode_snapshot(doc, body.to_vec().into(), origin, budget.as_mut())?
         }
         _ => {
             return Err(LoroError::DecodeError(
@@ -555,14 +674,37 @@ impl LoroDoc {
         blob: &[u8],
         check_checksum: bool,
     ) -> LoroResult<ImportBlobMetadata> {
+        Self::decode_blob_meta(blob, check_checksum, None)
+    }
+
+    /// [`Self::decode_import_blob_meta`] for untrusted bytes: every count
+    /// the blob claims is checked against `budget` before it sizes an
+    /// allocation, as in [`LoroDoc::import_with_budget`].
+    pub fn decode_import_blob_meta_with_budget(
+        blob: &[u8],
+        check_checksum: bool,
+        budget: ImportBudget,
+    ) -> LoroResult<ImportBlobMetadata> {
+        Self::decode_blob_meta(blob, check_checksum, Some(budget))
+    }
+
+    fn decode_blob_meta(
+        blob: &[u8],
+        check_checksum: bool,
+        mut budget: Option<ImportBudget>,
+    ) -> LoroResult<ImportBlobMetadata> {
         let parsed = parse_header_and_body(blob, check_checksum)?;
         match parsed.mode {
             EncodeMode::Auto => unreachable!(),
             EncodeMode::OutdatedRle | EncodeMode::OutdatedSnapshot => {
                 Err(LoroError::ImportUnsupportedEncodingMode)
             }
-            EncodeMode::FastSnapshot => fast_snapshot::decode_snapshot_blob_meta(parsed),
-            EncodeMode::FastUpdates => fast_snapshot::decode_updates_blob_meta(parsed),
+            EncodeMode::FastSnapshot => {
+                fast_snapshot::decode_snapshot_blob_meta(parsed, budget.as_mut())
+            }
+            EncodeMode::FastUpdates => {
+                fast_snapshot::decode_updates_blob_meta(parsed, budget.as_mut())
+            }
         }
     }
 }

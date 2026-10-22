@@ -633,7 +633,9 @@ impl<'a> ValueReader<'a> {
                 if len > MAX_COLLECTION_SIZE {
                     return Err(LoroError::DecodeDataCorruptionError);
                 }
-                let mut ans = Vec::with_capacity(len);
+                // Every element takes at least one byte, so the bytes left
+                // bound the capacity whatever length the input claims.
+                let mut ans = Vec::with_capacity(len.min(self.raw.len()));
                 for i in 0..len {
                     ans.push(self.recursive_read_value_type_and_content(keys, id.inc(i as i32))?);
                 }
@@ -644,7 +646,10 @@ impl<'a> ValueReader<'a> {
                 if len > MAX_COLLECTION_SIZE {
                     return Err(LoroError::DecodeDataCorruptionError);
                 }
-                let mut ans = FxHashMap::with_capacity_and_hasher(len, Default::default());
+                let mut ans = FxHashMap::with_capacity_and_hasher(
+                    len.min(self.raw.len()),
+                    Default::default(),
+                );
                 for _ in 0..len {
                     let key_idx = self.read_usize()?;
                     let key = keys
@@ -743,7 +748,7 @@ impl<'a> ValueReader<'a> {
                         if len > MAX_COLLECTION_SIZE {
                             return Err(LoroError::DecodeDataCorruptionError);
                         }
-                        let ans = Vec::with_capacity(len);
+                        let ans = Vec::with_capacity(len.min(self.raw.len()));
                         stack.push(task);
                         stack.push(Task::ReadList {
                             left: len,
@@ -758,7 +763,10 @@ impl<'a> ValueReader<'a> {
                             return Err(LoroError::DecodeDataCorruptionError);
                         }
 
-                        let ans = FxHashMap::with_capacity_and_hasher(len, Default::default());
+                        let ans = FxHashMap::with_capacity_and_hasher(
+                            len.min(self.raw.len()),
+                            Default::default(),
+                        );
                         stack.push(task);
                         stack.push(Task::ReadMap {
                             left: len,

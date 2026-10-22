@@ -277,6 +277,19 @@ impl MemKvStore {
         ans
     }
 
+    /// Returns the size of the blocks of a serialized store after
+    /// decompression, or `None` as soon as it would pass `limit`.
+    ///
+    /// See [`SsTable::decompressed_size`]. Empty bytes, which
+    /// [`Self::import_all`] ignores, have size 0.
+    pub fn decompressed_size(bytes: &Bytes, limit: usize) -> Result<Option<usize>, String> {
+        if bytes.is_empty() {
+            return Ok(Some(0));
+        }
+
+        SsTable::decompressed_size(bytes, limit).map_err(|e| e.to_string())
+    }
+
     /// Import a serialized store, verifying every block's checksum. Can be
     /// called multiple times; later imports override earlier keys.
     pub fn import_all(&mut self, bytes: Bytes) -> Result<(), String> {

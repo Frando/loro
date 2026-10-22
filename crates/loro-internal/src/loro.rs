@@ -518,7 +518,7 @@ impl LoroDoc {
         let ParsedHeaderAndBody { mode, body, .. } = parse_header_and_body(bytes, true)?;
         if mode.is_snapshot() {
             doc.with_barrier(|| -> Result<(), LoroError> {
-                decode_snapshot(&doc, mode, body, Default::default())?;
+                decode_snapshot(&doc, mode, body, Default::default(), None)?;
                 Ok(())
             })?;
             Ok(doc)
@@ -612,7 +612,29 @@ impl LoroDoc {
         bytes: &[u8],
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
-        self.with_barrier(|| self._import_with(bytes, origin))
+        self.with_barrier(|| self._import_with(bytes, origin, None))
+    }
+
+    /// Imports untrusted bytes like [`Self::import`], with every count they
+    /// claim checked against `budget` before it sizes an allocation.
+    ///
+    /// An import that would exceed the budget fails with
+    /// [`LoroError::DecodeError`] whose message starts with
+    /// [`crate::encoding::IMPORT_BUDGET_EXCEEDED`], and leaves the document
+    /// as it was. The budget covers fast updates and fast snapshots: their
+    /// change blocks (change counts, ops, deps, columns) and the LZ4 output
+    /// of the snapshot's change store and state. The state section of a
+    /// snapshot is decoded lazily later and is not covered beyond its LZ4
+    /// output. Shallow snapshots and the outdated encodings are refused under
+    /// a budget.
+    pub fn import_with_budget(
+        &self,
+        bytes: &[u8],
+        budget: crate::encoding::ImportBudget,
+    ) -> Result<ImportStatus, LoroError> {
+        let s = debug_span!("import_with_budget", peer = self.peer_id());
+        let _e = s.enter();
+        self.with_barrier(|| self._import_with(bytes, Default::default(), Some(budget)))
     }
 
     #[tracing::instrument(skip_all)]
@@ -620,10 +642,19 @@ impl LoroDoc {
         &self,
         bytes: &[u8],
         origin: InternalString,
+        budget: Option<crate::encoding::ImportBudget>,
     ) -> Result<ImportStatus, LoroError> {
         ensure_cov::notify_cov("loro_internal::import");
         let parsed = parse_header_and_body(bytes, true)?;
         loro_common::info!("Importing with mode={:?}", &parsed.mode);
+        if budget.is_some()
+            && matches!(
+                parsed.mode,
+                EncodeMode::OutdatedRle | EncodeMode::OutdatedSnapshot
+            )
+        {
+            return Err(LoroError::ImportUnsupportedEncodingMode);
+        }
         let result = match parsed.mode {
             EncodeMode::OutdatedRle => {
                 if self.state.lock().is_in_txn() {
@@ -644,7 +675,7 @@ impl LoroDoc {
             EncodeMode::OutdatedSnapshot => {
                 if self.can_reset_with_snapshot() {
                     loro_common::info!("Init by snapshot {}", self.peer_id());
-                    decode_snapshot(self, parsed.mode, parsed.body, origin)
+                    decode_snapshot(self, parsed.mode, parsed.body, origin, None)
                 } else {
                     self.update_oplog_and_apply_delta_to_state_if_needed(
                         |oplog| oplog.decode(parsed),
@@ -656,10 +687,10 @@ impl LoroDoc {
                 if self.can_reset_with_snapshot() {
                     ensure_cov::notify_cov("loro_internal::import::snapshot");
                     loro_common::info!("Init by fast snapshot {}", self.peer_id());
-                    decode_snapshot(self, parsed.mode, parsed.body, origin)
+                    decode_snapshot(self, parsed.mode, parsed.body, origin, budget)
                 } else {
                     self.import_changes_and_apply_delta_to_state_if_needed(
-                        |oplog| encoding::decode_oplog_changes(oplog, parsed),
+                        |oplog| encoding::decode_oplog_changes_with_budget(oplog, parsed, budget),
                         origin,
                     )
 
@@ -670,7 +701,7 @@ impl LoroDoc {
                 }
             }
             EncodeMode::FastUpdates => self.import_changes_and_apply_delta_to_state_if_needed(
-                |oplog| encoding::decode_oplog_changes(oplog, parsed),
+                |oplog| encoding::decode_oplog_changes_with_budget(oplog, parsed, budget),
                 origin,
             ),
             EncodeMode::Auto => {
@@ -1557,7 +1588,7 @@ impl LoroDoc {
             for (_meta, data) in meta_arr {
                 #[cfg(test)]
                 take_panic_at_batch_import_blob_for_test();
-                match guard.doc._import_with(data, Default::default()) {
+                match guard.doc._import_with(data, Default::default(), None) {
                     Ok(s) => {
                         for (peer, (start, end)) in s.success.iter() {
                             match success.0.entry(*peer) {

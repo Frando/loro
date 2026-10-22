@@ -22,7 +22,9 @@ use crate::{
 use bytes::{Buf, Bytes};
 use loro_common::{HasCounterSpan, IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult};
 
-use super::{EncodedBlobMode, ImportBlobMetadata, ParsedHeaderAndBody};
+use super::{
+    EncodedBlobMode, ImportBlobMetadata, ImportBudget, ParsedHeaderAndBody, IMPORT_BUDGET_EXCEEDED,
+};
 pub(crate) const EMPTY_MARK: &[u8] = b"E";
 pub(crate) struct Snapshot {
     pub oplog_bytes: Bytes,
@@ -156,9 +158,10 @@ pub(crate) fn decode_snapshot(
     doc: &LoroDoc,
     bytes: Bytes,
     origin: InternalString,
+    budget: Option<&mut ImportBudget>,
 ) -> LoroResult<()> {
     let snapshot = _decode_snapshot_bytes(bytes)?;
-    decode_snapshot_inner(snapshot, doc, origin)
+    decode_snapshot_inner_with_budget(snapshot, doc, origin, budget)
 }
 
 pub(crate) fn decode_snapshot_inner(
@@ -166,11 +169,35 @@ pub(crate) fn decode_snapshot_inner(
     doc: &LoroDoc,
     origin: InternalString,
 ) -> Result<(), LoroError> {
+    decode_snapshot_inner_with_budget(snapshot, doc, origin, None)
+}
+
+/// [`decode_snapshot_inner`], with the snapshot checked against `budget`
+/// when there is one.
+///
+/// Under a budget, the change store is decoded once against the budget, and
+/// the compressed blocks of the state section count against
+/// `decompressed_bytes`. The state section is decoded lazily, container by
+/// container, as before; the budget does not cover that decoding. Shallow
+/// snapshots, whose shallow root state is decoded during the import, are
+/// refused.
+fn decode_snapshot_inner_with_budget(
+    snapshot: Snapshot,
+    doc: &LoroDoc,
+    origin: InternalString,
+    mut budget: Option<&mut ImportBudget>,
+) -> Result<(), LoroError> {
     let Snapshot {
         oplog_bytes,
         state_bytes,
         shallow_root_state_bytes,
     } = snapshot;
+    if budget.is_some() && !shallow_root_state_bytes.is_empty() {
+        return Err(LoroError::DecodeError(
+            format!("{IMPORT_BUDGET_EXCEEDED}: shallow snapshots are not supported under a budget")
+                .into_boxed_str(),
+        ));
+    }
     ensure_cov::notify_cov("loro_internal::import::fast_snapshot::decode_snapshot");
     let mut oplog = doc.oplog().lock();
     if !oplog.is_empty() {
@@ -205,11 +232,14 @@ pub(crate) fn decode_snapshot_inner(
 
     let arena_checkpoint = oplog.arena.checkpoint_for_rollback();
     let decode_result = (|| -> LoroResult<()> {
-        oplog.decode_change_store(oplog_bytes)?;
+        oplog.decode_change_store_with_budget(oplog_bytes, budget.as_deref_mut())?;
         let state_frontiers;
         if shallow_root_state_bytes.is_empty() {
             ensure_cov::notify_cov("loro_internal::import::snapshot::normal");
             if let Some(bytes) = state_bytes {
+                if let Some(budget) = budget.as_mut() {
+                    budget.charge_kv_bytes(&bytes)?;
+                }
                 state.store.decode(bytes)?;
             }
             state_frontiers = oplog.frontiers().clone();
@@ -275,8 +305,12 @@ pub(crate) fn decode_snapshot_inner(
 }
 
 impl OpLog {
-    pub(super) fn decode_change_store(&mut self, bytes: bytes::Bytes) -> LoroResult<()> {
-        let v = self.change_store().import_all(bytes)?;
+    pub(super) fn decode_change_store_with_budget(
+        &mut self,
+        bytes: bytes::Bytes,
+        budget: Option<&mut ImportBudget>,
+    ) -> LoroResult<()> {
+        let v = self.change_store().import_all_with_budget(bytes, budget)?;
         self.dag.set_version_by_fast_snapshot_import(v);
         self.refresh_visible_op_count();
         Ok(())
@@ -335,7 +369,11 @@ pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Result<Snapshot, LoroEncod
     snapshot
 }
 
-pub(crate) fn decode_oplog(oplog: &mut OpLog, bytes: &[u8]) -> Result<Vec<Change>, LoroError> {
+pub(crate) fn decode_oplog(
+    oplog: &mut OpLog,
+    bytes: &[u8],
+    budget: Option<&mut ImportBudget>,
+) -> Result<Vec<Change>, LoroError> {
     let oplog_len = bytes
         .get(0..4)
         .ok_or_else(|| LoroError::DecodeError("decode_oplog: missing length prefix".into()))?;
@@ -351,6 +389,7 @@ pub(crate) fn decode_oplog(oplog: &mut OpLog, bytes: &[u8]) -> Result<Vec<Change
         oplog_bytes.to_vec().into(),
         &oplog.arena,
         oplog.vv(),
+        budget,
     )?;
     changes.sort_unstable_by_key(|x| x.lamport);
     Ok(changes)
@@ -369,7 +408,11 @@ pub(crate) fn encode_updates_in_range<W: std::io::Write>(
     oplog.export_blocks_in_range(spans, w);
 }
 
-pub(crate) fn decode_updates(oplog: &mut OpLog, body: Bytes) -> Result<Vec<Change>, LoroError> {
+pub(crate) fn decode_updates(
+    oplog: &mut OpLog,
+    body: Bytes,
+    mut budget: Option<&mut ImportBudget>,
+) -> Result<Vec<Change>, LoroError> {
     let mut reader: &[u8] = body.as_ref();
     let mut index = 0;
     let self_vv = oplog.vv();
@@ -389,7 +432,12 @@ pub(crate) fn decode_updates(oplog: &mut OpLog, body: Bytes) -> Result<Vec<Chang
             ));
         }
         let block_bytes = body.slice(index..end);
-        let new_changes = ChangeStore::decode_block_bytes(block_bytes, &oplog.arena, self_vv)?;
+        let new_changes = ChangeStore::decode_block_bytes(
+            block_bytes,
+            &oplog.arena,
+            self_vv,
+            budget.as_deref_mut(),
+        )?;
         changes.extend(new_changes);
         index = end;
         reader = &reader[len..];
@@ -405,6 +453,84 @@ mod tests {
     use crate::{
         encoding::ExportMode, handler::HandlerTrait, utils::kv_wrapper::KvWrapper, MapHandler,
     };
+
+    /// `kv` (serialized KV store bytes) with a 64 MiB value of zeros added,
+    /// which LZ4 compresses to a few hundred KiB.
+    fn with_lz4_bomb(kv: Bytes) -> Bytes {
+        let store = KvWrapper::new_mem();
+        store.import(kv).unwrap();
+        store.insert(b"bomb", Bytes::from(vec![0u8; 64 << 20]));
+        store.export()
+    }
+
+    fn snapshot_blob(snapshot: &Snapshot) -> Vec<u8> {
+        let mut body = Vec::new();
+        _encode_snapshot(snapshot, &mut body);
+        crate::encoding::encode_blob_for_test(crate::encoding::EncodeMode::FastSnapshot, &body)
+    }
+
+    /// LZ4 blocks in the change store or the state of a snapshot that expand
+    /// past the budget are refused, after decompressing at most about the
+    /// budget, and the document stays empty.
+    #[test]
+    fn lz4_bombs_are_refused_under_a_budget() {
+        let source = LoroDoc::new_auto_commit();
+        source.get_map("map").insert("k", 1).unwrap();
+        source.commit_then_renew();
+        let budget = ImportBudget {
+            changes: 10,
+            ops: 10,
+            decompressed_bytes: 1 << 20,
+        };
+        for in_state in [false, true] {
+            let mut snapshot = snapshot_sections(&source);
+            if in_state {
+                snapshot.state_bytes = Some(with_lz4_bomb(snapshot.state_bytes.take().unwrap()));
+            } else {
+                snapshot.oplog_bytes = with_lz4_bomb(snapshot.oplog_bytes);
+            }
+            let blob = snapshot_blob(&snapshot);
+            assert!(blob.len() < 1 << 20, "a small blob");
+            let doc = LoroDoc::new();
+            let err = doc.import_with_budget(&blob, budget).unwrap_err();
+            assert!(err.to_string().contains(IMPORT_BUDGET_EXCEEDED), "{err}");
+            assert!(doc.oplog_vv().is_empty());
+            doc.get_map("map").insert("after", 1).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_snapshot_imports_with_its_lz4_output_in_the_budget() {
+        let source = LoroDoc::new_auto_commit();
+        source
+            .get_text("text")
+            .insert(
+                0,
+                &"lorem ipsum ".repeat(1000),
+                crate::cursor::PosType::Unicode,
+            )
+            .unwrap();
+        source.commit_then_renew();
+        let bytes = source.export(ExportMode::Snapshot).unwrap();
+        let budget = ImportBudget {
+            changes: 10,
+            ops: 12_000,
+            decompressed_bytes: 1 << 20,
+        };
+        let doc = LoroDoc::new();
+        doc.import_with_budget(&bytes, budget).unwrap();
+        assert_eq!(doc.get_deep_value(), source.get_deep_value());
+        let err = LoroDoc::new()
+            .import_with_budget(
+                &bytes,
+                ImportBudget {
+                    decompressed_bytes: 1000,
+                    ..budget
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains(IMPORT_BUDGET_EXCEEDED), "{err}");
+    }
 
     fn snapshot_sections(doc: &LoroDoc) -> Snapshot {
         let encoded = doc.export(ExportMode::Snapshot).unwrap();
@@ -437,7 +563,7 @@ mod tests {
     fn decode_updates_rejects_truncated_block() {
         let doc = LoroDoc::new();
         let mut oplog = doc.oplog.lock();
-        let err = decode_updates(&mut oplog, Bytes::from_static(&[0x02, 0x01]))
+        let err = decode_updates(&mut oplog, Bytes::from_static(&[0x02, 0x01]), None)
             .expect_err("truncated update block should be rejected");
         assert!(matches!(err, LoroError::DecodeError(_)));
     }
@@ -540,6 +666,7 @@ mod tests {
 
 pub(crate) fn decode_snapshot_blob_meta(
     parsed: ParsedHeaderAndBody,
+    budget: Option<&mut ImportBudget>,
 ) -> LoroResult<ImportBlobMetadata> {
     let (oplog_bytes, is_shallow) = _decode_snapshot_meta_partial(parsed.body)?;
     let mode = if is_shallow {
@@ -550,7 +677,7 @@ pub(crate) fn decode_snapshot_blob_meta(
 
     let doc = LoroDoc::new();
     let mut oplog = doc.oplog.lock();
-    oplog.decode_change_store(oplog_bytes.to_vec().into())?;
+    oplog.decode_change_store_with_budget(oplog_bytes.to_vec().into(), budget)?;
     let timestamp = oplog.get_greatest_timestamp(oplog.dag.frontiers());
     let f = oplog.dag.shallow_since_frontiers().clone();
     let start_timestamp = oplog.get_timestamp_of_version(&f);
@@ -569,10 +696,11 @@ pub(crate) fn decode_snapshot_blob_meta(
 
 pub(crate) fn decode_updates_blob_meta(
     parsed: ParsedHeaderAndBody,
+    budget: Option<&mut ImportBudget>,
 ) -> LoroResult<ImportBlobMetadata> {
     let doc = LoroDoc::new();
     let mut oplog = doc.oplog.lock();
-    let changes = decode_updates(&mut oplog, parsed.body.to_vec().into())?;
+    let changes = decode_updates(&mut oplog, parsed.body.to_vec().into(), budget)?;
     let mut start_vv = VersionVector::new();
     let mut end_vv = VersionVector::new();
     for c in changes.iter() {

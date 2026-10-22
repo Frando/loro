@@ -9,6 +9,7 @@ use super::{
     outdated_encode_reordered::PeerIdx,
     value::{Value, ValueDecodedArenasTrait, ValueEncodeRegister},
     value_register::ValueRegister,
+    ImportBudget,
 };
 
 #[derive(Debug)]
@@ -100,7 +101,6 @@ impl ContainerArena {
             containers: serde_columnar::from_bytes(bytes)?,
         })
     }
-
     pub fn from_containers(
         cids: Vec<ContainerID>,
         peer_register: &mut ValueRegister<PeerID>,
@@ -190,6 +190,21 @@ impl<'a> PositionArena<'a> {
     }
 
     pub fn try_parse_to_positions(self) -> LoroResult<Vec<Vec<u8>>> {
+        self.parse_to_positions(None)
+    }
+
+    /// [`Self::try_parse_to_positions`], with the bytes of the decoded
+    /// positions taken from `budget`'s `decompressed_bytes` before each is
+    /// allocated: a position repeats a prefix of the one before it, so a
+    /// few bytes can decode to many long positions.
+    pub(crate) fn try_parse_to_positions_with_budget(
+        self,
+        budget: &mut ImportBudget,
+    ) -> LoroResult<Vec<Vec<u8>>> {
+        self.parse_to_positions(Some(budget))
+    }
+
+    fn parse_to_positions(self, mut budget: Option<&mut ImportBudget>) -> LoroResult<Vec<Vec<u8>>> {
         let mut ans: Vec<Vec<u8>> = Vec::with_capacity(self.positions.len());
         for PositionDelta {
             common_prefix_length,
@@ -218,6 +233,9 @@ impl<'a> PositionArena<'a> {
                         "Decode position arena failed: position length overflow".into(),
                     )
                 })?;
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.charge_decompressed(capacity)?;
+            }
             let mut p = Vec::with_capacity(capacity);
             if let Some(last_bytes) = ans.last() {
                 p.extend_from_slice(&last_bytes[0..common_prefix_length]);
@@ -251,6 +269,39 @@ impl<'a> PositionArena<'a> {
 
         Ok(serde_columnar::from_bytes(bytes)?)
     }
+
+    /// [`Self::decode_v2`], refused once it decodes more than `max_len`
+    /// positions. The columns are decoded lazily, so run length encoding
+    /// cannot expand them past `max_len` first.
+    pub(crate) fn decode_v2_capped<'de: 'a>(bytes: &'de [u8], max_len: usize) -> LoroResult<Self> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let iter = serde_columnar::iter_from_bytes::<PositionArena<'de>>(bytes)?.positions;
+        Ok(Self {
+            positions: collect_capped(iter, max_len, "positions")?,
+        })
+    }
+}
+
+/// Collects a lazily decoded column, refusing it once it has more than
+/// `max_len` elements.
+fn collect_capped<T>(
+    iter: impl Iterator<Item = Result<T, serde_columnar::ColumnarError>>,
+    max_len: usize,
+    what: &str,
+) -> LoroResult<Vec<T>> {
+    let mut ans = Vec::new();
+    for item in iter {
+        if ans.len() == max_len {
+            return Err(LoroError::DecodeError(
+                format!("Decode block error: more {what} than atoms").into_boxed_str(),
+            ));
+        }
+        ans.push(item?);
+    }
+    Ok(ans)
 }
 
 fn longest_common_prefix_length(a: &[u8], b: &[u8]) -> usize {
