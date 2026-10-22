@@ -65,6 +65,7 @@ pub use loro_internal::json::{
 pub use loro_internal::kv_store::{KvStore, MemKvStore};
 pub use loro_internal::loro::CommitOptions;
 pub use loro_internal::loro::DocAnalysis;
+pub use loro_internal::op_view;
 pub use loro_internal::oplog::FrontiersNotIncluded;
 pub use loro_internal::undo;
 pub use loro_internal::version::{Frontiers, VersionRange, VersionVector, VersionVectorDiff};
@@ -822,6 +823,45 @@ impl LoroDoc {
     /// ```
     pub fn export_json_in_id_span(&self, id_span: IdSpan) -> Vec<JsonChange> {
         self.doc.export_json_in_id_span(id_span)
+    }
+
+    /// Calls `f` for every committed op that overlaps `id_span`, in counter
+    /// order, with borrowed views of the op and of its change.
+    ///
+    /// This reads the same changes and ops as [`Self::export_json_in_id_span`]
+    /// without building JSON: texts, keys and values are borrowed. Ops and
+    /// changes are given whole, so the first and the last may start before
+    /// or end after `id_span`; `OpView::counter` and `OpView::len` give the
+    /// op's counter range. Uncommitted ops are not visited (call
+    /// [`Self::commit`] first). The oplog stays locked while `f` runs, so
+    /// `f` must not call back into the document.
+    ///
+    /// Returns the counter after the last op visited, see
+    /// [`loro_internal::OpLog::visit_ops_in_span`].
+    ///
+    /// # Example
+    /// ```
+    /// use loro::{LoroDoc, IdSpan};
+    /// use loro::op_view::OpContentView;
+    ///
+    /// let doc = LoroDoc::new();
+    /// doc.set_peer_id(1).unwrap();
+    /// doc.get_text("text").insert(0, "Hello").unwrap();
+    /// doc.commit();
+    /// let mut texts = Vec::new();
+    /// doc.visit_ops_in_id_span(IdSpan::new(1, 0, 5), &mut |_change, op| {
+    ///     if let OpContentView::TextInsert { text, .. } = op.content {
+    ///         texts.push(text.to_string());
+    ///     }
+    /// });
+    /// assert_eq!(texts, ["Hello"]);
+    /// ```
+    pub fn visit_ops_in_id_span(
+        &self,
+        id_span: IdSpan,
+        f: &mut dyn FnMut(&op_view::ChangeView<'_>, &op_view::OpView<'_>),
+    ) -> Counter {
+        self.doc.oplog().lock().visit_ops_in_span(id_span, f)
     }
 
     /// Convert `Frontiers` into `VersionVector`
