@@ -313,12 +313,19 @@ impl OpLog {
     pub(crate) fn preflight_import_changes(&self, changes: &[Change]) -> ImportChangesPreflight {
         let mut ans = ImportChangesPreflight::default();
         for change in changes {
-            if change.ctr_end() <= self.vv().get(&change.id.peer).copied().unwrap_or(0) {
+            let held = self.vv().get(&change.id.peer).copied().unwrap_or(0);
+            if change.ctr_end() <= held {
                 continue;
             }
 
             if self.dag.import_deps_before_shallow_root(&change.deps) {
                 ans.has_deps_before_shallow_root = true;
+                continue;
+            }
+
+            // A change past the held counter is parked by
+            // `import_changes_to_oplog`, so it does not reach the DAG.
+            if change.id.counter > held {
                 continue;
             }
 
