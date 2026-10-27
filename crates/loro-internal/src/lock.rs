@@ -188,6 +188,12 @@ impl<T> LoroMutex<T> {
         self.lock.is_locked()
     }
 
+    /// Returns whether a thread panicked while holding this lock, so that
+    /// [`LoroMutex::lock`] panics.
+    pub fn is_poisoned(&self) -> bool {
+        self.lock.is_poisoned()
+    }
+
     /// Returns whether acquiring this lock would satisfy the current thread's
     /// lock-order constraints.
     ///

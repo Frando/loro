@@ -179,6 +179,17 @@ pub const LORO_VERSION: &str = include_str!("../VERSION");
 impl Drop for LoroDoc {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
+            // After a panic while one of the document's locks was held, the
+            // lock is poisoned and the implicit commit would panic again. A
+            // panic in `drop` aborts the process when it runs during the
+            // unwind, so skip the commit: the document is unusable anyway.
+            if self.txn.is_poisoned()
+                || self.oplog.is_poisoned()
+                || self.state.is_poisoned()
+                || self.diff_calculator.is_poisoned()
+            {
+                return;
+            }
             let _ = self.implicit_commit_then_stop();
         }
     }
