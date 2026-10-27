@@ -59,6 +59,16 @@ impl PendingChanges {
         Some(self.changes.get(&peer)?.get(&counter)?.len())
     }
 
+    /// The number of atoms of all parked changes, counting overlaps twice.
+    pub(crate) fn atom_count(&self) -> u64 {
+        self.changes
+            .values()
+            .flat_map(|tree| tree.values())
+            .flatten()
+            .map(|change| rle::HasLength::atom_len(&**change) as u64)
+            .sum()
+    }
+
     pub(crate) fn version_range(&self) -> VersionRange {
         let mut range = VersionRange::default();
         for tree in self.changes.values() {

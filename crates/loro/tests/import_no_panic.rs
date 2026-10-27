@@ -2,7 +2,11 @@
 //! abort the process when the document was dropped during the unwind) are
 //! import errors before anything is mutated.
 
-use loro::{CommitOptions, ExportMode, JsonSchema, LoroDoc, VersionVector, ID};
+use loro::{
+    json::{JsonOp, JsonOpContent, ListOp},
+    CommitOptions, ContainerID, ContainerType, ExportMode, JsonChange, JsonSchema, LoroDoc,
+    VersionVector, ID,
+};
 
 /// Alice's three changes (counters 0, 1, 2), one map key each, and a
 /// change of Bob that depends on her second (so her node at counter 1 has
@@ -153,4 +157,109 @@ fn a_refused_change_refuses_the_whole_import() {
         y.get_map("m").get("c").unwrap().into_value().unwrap(),
         "c".into()
     );
+}
+
+/// A change of `peer` at counter 0 that deletes `len` list elements, with
+/// `deps`.
+fn long_delete(peer: u64, len: i32, deps: Vec<ID>) -> JsonChange {
+    JsonChange {
+        id: ID::new(peer, 0),
+        timestamp: 0,
+        deps,
+        lamport: 0,
+        msg: None,
+        ops: vec![JsonOp {
+            content: JsonOpContent::List(ListOp::Delete {
+                pos: 0,
+                len,
+                start_id: ID::new(peer, 0),
+            }),
+            container: ContainerID::new_root("l", ContainerType::List),
+            counter: 0,
+        }],
+    }
+}
+
+fn schema(changes: Vec<JsonChange>) -> JsonSchema {
+    JsonSchema {
+        schema_version: 1,
+        start_version: Default::default(),
+        peers: None,
+        changes,
+    }
+}
+
+/// Three chained changes of 2^31 - 2 atoms each would get lamports past
+/// `u32::MAX`, which overflowed the lamport arithmetic of the DAG. They
+/// are an import error, also when they arrive in separate imports.
+#[test]
+fn lamports_past_u32_are_an_import_error() {
+    let len = i32::MAX - 1;
+    let a = long_delete(1, len, vec![]);
+    let b = long_delete(2, len, vec![ID::new(1, len - 1)]);
+    let c = long_delete(3, len, vec![ID::new(2, len - 1)]);
+    for detached in [true, false] {
+        assert!(import_fails(
+            schema(vec![a.clone(), b.clone(), c.clone()]),
+            detached
+        ));
+    }
+    // The deletes target elements that do not exist, so the oplog is
+    // checked without computing a state.
+    let y = LoroDoc::new();
+    y.detach();
+    y.import_json_updates(schema(vec![a, b])).unwrap();
+    let vv = y.oplog_vv();
+    assert!(y.import_json_updates(schema(vec![c])).is_err());
+    assert_eq!(y.oplog_vv(), vv);
+    assert_eq!(y.len_ops(), 2 * len as usize);
+}
+
+/// Parked changes count too: the change that would overflow arrives
+/// first and waits, then its deps arrive.
+#[test]
+fn parked_changes_count_toward_the_lamport_limit() {
+    let len = i32::MAX - 1;
+    let y = LoroDoc::new();
+    y.detach();
+    let status = y
+        .import_json_updates(schema(vec![long_delete(3, len, vec![ID::new(2, len - 1)])]))
+        .unwrap();
+    assert!(status.pending.is_some());
+    y.import_json_updates(schema(vec![long_delete(1, len, vec![])]))
+        .unwrap();
+    assert!(y
+        .import_json_updates(schema(vec![long_delete(2, len, vec![ID::new(1, len - 1)])]))
+        .is_err());
+    assert_eq!(y.oplog_vv().get(&2), None);
+    assert_eq!(y.oplog_vv().get(&3), None);
+}
+
+/// Changes without ops, with ops that do not continue from the change's
+/// counter, or with a negative dep counter broke the counter arithmetic
+/// of the DAG and the change store. They are import errors.
+#[test]
+fn malformed_change_counters_are_import_errors() {
+    let honest = alice_three_and_bob();
+    let c = honest
+        .changes
+        .iter()
+        .position(|c| c.id == ID::new(1, 1))
+        .unwrap();
+    let mut cases = Vec::new();
+    let mut json = honest.clone();
+    json.changes[c].ops.clear();
+    cases.push(("no ops", json));
+    let mut json = honest.clone();
+    json.changes[c].ops[0].counter = 5;
+    cases.push(("gap", json));
+    let mut json = honest.clone();
+    json.changes.retain(|c| c.id.peer == 2);
+    json.changes[0].deps = vec![ID::new(1, -3)];
+    cases.push(("negative dep", json));
+    for (what, json) in cases {
+        for detached in [true, false] {
+            assert!(import_fails(json.clone(), detached), "{what}");
+        }
+    }
 }
