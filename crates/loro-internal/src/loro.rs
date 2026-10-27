@@ -764,7 +764,9 @@ impl LoroDoc {
     ) -> Result<ImportStatus, LoroError> {
         let mut oplog = self.oplog.lock();
         let arena_checkpoint = oplog.arena.checkpoint_for_rollback();
-        let changes = match decode_changes(&mut oplog) {
+        let changes = match decode_changes(&mut oplog)
+            .and_then(|changes| oplog.check_imported_changes(&changes).map(|()| changes))
+        {
             Ok(changes) => changes,
             Err(e) => {
                 oplog.arena.rollback(arena_checkpoint);

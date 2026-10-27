@@ -235,6 +235,7 @@ pub(crate) fn decode_oplog(
     parsed: ParsedHeaderAndBody,
 ) -> Result<ImportStatus, LoroError> {
     let changes = decode_oplog_changes(oplog, parsed)?;
+    oplog.check_imported_changes(&changes)?;
     let result = apply_decoded_changes_to_oplog(oplog, changes);
     if result.has_deps_before_shallow_root {
         return Err(LoroError::ImportUpdatesThatDependsOnOutdatedVersion);
