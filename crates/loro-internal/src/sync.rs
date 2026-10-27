@@ -59,6 +59,19 @@ impl<T: ?Sized> Mutex<T> {
     pub(crate) fn is_locked(&self) -> bool {
         self.inner.try_lock().is_err()
     }
+
+    /// Whether a thread panicked while holding this mutex. Locking it then
+    /// panics.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        #[cfg(not(loom))]
+        {
+            self.inner.is_poisoned()
+        }
+        #[cfg(loom)]
+        {
+            false
+        }
+    }
 }
 
 impl<T: Default> Default for Mutex<T> {
