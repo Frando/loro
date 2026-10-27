@@ -263,3 +263,56 @@ fn malformed_change_counters_are_import_errors() {
         }
     }
 }
+
+/// Alice's first two changes with timestamps `t0` and `t1`.
+fn two_changes_at(t0: i64, t1: i64) -> JsonSchema {
+    let mut json = alice_three_and_bob();
+    json.changes.retain(|c| c.id.peer == 1 && c.id.counter < 2);
+    json.changes[0].timestamp = t0;
+    json.changes[1].timestamp = t1;
+    json
+}
+
+/// Timestamps whose difference may not fit an `i64` overflowed when the
+/// change store merged two changes, or when it delta-encoded a block on
+/// export. They are import errors.
+#[test]
+fn extreme_timestamps_are_import_errors() {
+    for (t0, t1) in [
+        (0, i64::MIN),
+        (i64::MAX, i64::MIN),
+        (0, 1 << 62),
+        (0, -(1 << 62)),
+    ] {
+        for detached in [true, false] {
+            assert!(import_fails(two_changes_at(t0, t1), detached));
+        }
+    }
+}
+
+/// A peer's second change with a timestamp before its first one used to
+/// fail a debug assertion when the change store merged the two. It
+/// imports, keeps its timestamp, and the document exports and reimports.
+#[test]
+fn backward_timestamps_import() {
+    const M: i64 = (1 << 62) - 1;
+    for (t0, t1) in [(10, 5), (M, -M), (-M, M)] {
+        let json = two_changes_at(t0, t1);
+        for detached in [true, false] {
+            let y = LoroDoc::new();
+            if detached {
+                y.detach();
+            }
+            y.import_json_updates(json.clone()).unwrap();
+            y.checkout_to_latest();
+            let z = LoroDoc::new();
+            z.import(&y.export(ExportMode::Snapshot).unwrap()).unwrap();
+            assert_eq!(z.get_deep_value(), y.get_deep_value());
+            let z = LoroDoc::new();
+            z.import(&y.export(ExportMode::all_updates()).unwrap())
+                .unwrap();
+            assert_eq!(z.get_deep_value(), y.get_deep_value());
+            assert_eq!(z.get_change(ID::new(1, 1)).unwrap().timestamp, t1);
+        }
+    }
+}

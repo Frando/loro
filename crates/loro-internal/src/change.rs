@@ -270,7 +270,13 @@ impl Change {
             && other.id.counter == self.id.counter + self.content_len() as Counter
             && other.deps.len() == 1
             && other.deps.as_single().unwrap().peer == self.id.peer
-            && other.timestamp - self.timestamp <= merge_interval
+            // Remote changes carry any timestamps: a later change of a peer
+            // with an earlier timestamp is not merged, and the difference
+            // must not overflow.
+            && other
+                .timestamp
+                .checked_sub(self.timestamp)
+                .is_some_and(|interval| (0..=merge_interval).contains(&interval))
             && self.commit_msg == other.commit_msg
         {
             debug_assert!(other.timestamp >= self.timestamp);

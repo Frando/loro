@@ -64,6 +64,11 @@ pub struct OpLog {
     pub(crate) import_rollback: Option<ImportRollback>,
 }
 
+/// The largest absolute timestamp of an imported change: 2^62 - 1, so that the
+/// difference of any two timestamps fits an `i64`. Clock timestamps are far
+/// below it.
+pub(crate) const MAX_ABS_TIMESTAMP: Timestamp = (1 << 62) - 1;
+
 pub(crate) struct ImportRollback {
     old_vv: VersionVector,
     arena: SharedArenaRollback,
@@ -325,6 +330,9 @@ impl OpLog {
     /// - its counter is not negative, it has at least one op, its ops are
     ///   contiguous from its counter on and not empty, and its counter range
     ///   fits a [`Counter`];
+    /// - its timestamp is within [`MAX_ABS_TIMESTAMP`] of 0, so that the
+    ///   difference of two timestamps fits an `i64` when the change store
+    ///   delta-encodes them;
     /// - no dep has a negative counter;
     /// - its only allowed dep on its own peer is `(peer, counter - 1)`. A
     ///   change with a single dep on an older op of its own peer gets a
@@ -349,6 +357,9 @@ impl OpLog {
             };
             if id.counter < 0 {
                 return bad("negative counter");
+            }
+            if !(-MAX_ABS_TIMESTAMP..=MAX_ABS_TIMESTAMP).contains(&change.timestamp) {
+                return bad("timestamp out of range");
             }
             if change.ops.is_empty() {
                 return bad("no ops");
