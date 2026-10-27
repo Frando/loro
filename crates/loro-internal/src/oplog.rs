@@ -310,6 +310,34 @@ impl OpLog {
         }
     }
 
+    /// Checks decoded remote changes before any of them touches the oplog.
+    ///
+    /// The only allowed dep of a change on its own peer is
+    /// `(peer, counter - 1)`. A change with a single dep on an older op of
+    /// its own peer gets a lamport from that dep, but the DAG merges it into
+    /// the peer's last node, whose lamport does not continue there, and
+    /// fails "lamport is not continuous"; a dep on its own or a later
+    /// counter can never be satisfied.
+    ///
+    /// Honest changes never have such a dep. The whole import is refused
+    /// on the first violation, so nothing is mutated.
+    pub(crate) fn check_imported_changes(&self, changes: &[Change]) -> Result<(), LoroError> {
+        for change in changes {
+            let id = change.id;
+            let bad = |what: &str| {
+                Err(LoroError::DecodeError(
+                    format!("Invalid change {id}: {what}").into_boxed_str(),
+                ))
+            };
+            for dep in change.deps.iter() {
+                if dep.peer == id.peer && dep.counter != id.counter - 1 {
+                    return bad("dep on an own op other than the previous one");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn preflight_import_changes(&self, changes: &[Change]) -> ImportChangesPreflight {
         let mut ans = ImportChangesPreflight::default();
         for change in changes {
