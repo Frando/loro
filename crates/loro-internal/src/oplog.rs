@@ -151,14 +151,20 @@ impl OpLog {
 
     #[inline]
     fn calc_visible_op_count(&self) -> usize {
-        let total = self.dag.vv().values().sum::<i32>() as usize;
+        // Summed as `usize`: the counters of many peers can exceed `i32`.
+        let total = self
+            .dag
+            .vv()
+            .values()
+            .map(|&ops| ops.max(0) as usize)
+            .sum::<usize>();
         let shallow = self
             .dag
             .shallow_since_vv()
             .iter()
-            .map(|(_, ops)| *ops)
-            .sum::<i32>() as usize;
-        total - shallow
+            .map(|(_, &ops)| ops.max(0) as usize)
+            .sum::<usize>();
+        total.saturating_sub(shallow)
     }
 
     #[inline]
@@ -312,16 +318,28 @@ impl OpLog {
 
     /// Checks decoded remote changes before any of them touches the oplog.
     ///
-    /// The only allowed dep of a change on its own peer is
-    /// `(peer, counter - 1)`. A change with a single dep on an older op of
-    /// its own peer gets a lamport from that dep, but the DAG merges it into
-    /// the peer's last node, whose lamport does not continue there, and
-    /// fails "lamport is not continuous"; a dep on its own or a later
-    /// counter can never be satisfied.
+    /// The import path relies on these properties of every change, and
+    /// invalid external bytes or JSON must be an import error instead of a
+    /// failed assertion deeper down:
     ///
-    /// Honest changes never have such a dep. The whole import is refused
+    /// - its counter is not negative, it has at least one op, its ops are
+    ///   contiguous from its counter on and not empty, and its counter range
+    ///   fits a [`Counter`];
+    /// - no dep has a negative counter;
+    /// - its only allowed dep on its own peer is `(peer, counter - 1)`. A
+    ///   change with a single dep on an older op of its own peer gets a
+    ///   lamport from that dep, but the DAG merges it into the peer's last
+    ///   node, whose lamport does not continue there; a dep on its own or a
+    ///   later counter can never be satisfied;
+    /// - the lamports it can get fit a [`Lamport`]: a change's lamport is
+    ///   one more than its largest dep's, so after this import no lamport
+    ///   exceeds the largest lamport held plus every imported and pending
+    ///   atom.
+    ///
+    /// Honest changes have all these properties. The whole import is refused
     /// on the first violation, so nothing is mutated.
     pub(crate) fn check_imported_changes(&self, changes: &[Change]) -> Result<(), LoroError> {
+        let mut atoms: u64 = 0;
         for change in changes {
             let id = change.id;
             let bad = |what: &str| {
@@ -329,11 +347,48 @@ impl OpLog {
                     format!("Invalid change {id}: {what}").into_boxed_str(),
                 ))
             };
+            if id.counter < 0 {
+                return bad("negative counter");
+            }
+            if change.ops.is_empty() {
+                return bad("no ops");
+            }
+            let mut end = id.counter;
+            for op in change.ops.iter() {
+                if op.counter != end {
+                    return bad("ops are not contiguous");
+                }
+                let len = op.atom_len();
+                if len == 0 {
+                    return bad("empty op");
+                }
+                let Some(op_end) = Counter::try_from(len)
+                    .ok()
+                    .and_then(|len| end.checked_add(len))
+                else {
+                    return bad("counter overflow");
+                };
+                end = op_end;
+            }
             for dep in change.deps.iter() {
+                if dep.counter < 0 {
+                    return bad("negative dep counter");
+                }
                 if dep.peer == id.peer && dep.counter != id.counter - 1 {
                     return bad("dep on an own op other than the previous one");
                 }
             }
+            atoms += (end - id.counter) as u64;
+        }
+
+        let held = self.dag.frontiers_to_next_lamport(self.dag.frontiers()) as u64;
+        let pending = self.pending_changes.atom_count();
+        if held + atoms + pending > Lamport::MAX as u64 {
+            return Err(LoroError::DecodeError(
+                "Invalid changes: their lamports would overflow"
+                    .to_string()
+                    .into_boxed_str(),
+            ));
         }
         Ok(())
     }
