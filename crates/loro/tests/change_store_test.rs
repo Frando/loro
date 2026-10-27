@@ -83,3 +83,30 @@ fn get_change_with_lamport_lte_after_snapshot_import() {
         assert!(expected.is_some());
     }
 }
+
+/// A change that depends on 1,100 concurrent changes is larger than a block
+/// before its first op. Splitting it into blocks used to underflow the room
+/// left in the block, and the commit panicked.
+#[test]
+fn change_with_more_deps_than_fit_a_block() {
+    let doc = LoroDoc::new();
+    for peer in 0..1100u64 {
+        let other = LoroDoc::new();
+        other.set_peer_id(peer + 10).unwrap();
+        other.get_map("m").insert(&format!("k{peer}"), 1).unwrap();
+        other.commit();
+        doc.import(&other.export(ExportMode::all_updates()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(doc.oplog_frontiers().len(), 1100);
+    doc.set_peer_id(1).unwrap();
+    doc.get_map("m").insert("merge", 1).unwrap();
+    doc.get_text("t").insert(0, &"x".repeat(10_000)).unwrap();
+    doc.commit();
+    for mode in [ExportMode::all_updates(), ExportMode::Snapshot] {
+        let copy = LoroDoc::new();
+        copy.import(&doc.export(mode).unwrap()).unwrap();
+        assert_eq!(copy.get_deep_value(), doc.get_deep_value());
+        assert_eq!(copy.oplog_vv(), doc.oplog_vv());
+    }
+}

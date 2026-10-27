@@ -1649,7 +1649,9 @@ mod mut_inner_kv {
             let mut total_len = 0;
             let mut estimated_size = new_change.estimate_storage_size();
             'outer: for mut op in change.ops.into_iter() {
-                if op.estimate_storage_size() >= MAX_BLOCK_SIZE - estimated_size {
+                // A change with many deps can exceed the block size before
+                // its first op, so the room left saturates at 0.
+                if op.estimate_storage_size() >= MAX_BLOCK_SIZE.saturating_sub(estimated_size) {
                     new_change = self._insert_splitted_change(
                         new_change,
                         &mut total_len,
@@ -1658,9 +1660,9 @@ mod mut_inner_kv {
                     );
                 }
 
-                while let Some(end) =
-                    op.check_whether_slice_content_to_fit_in_size(MAX_BLOCK_SIZE - estimated_size)
-                {
+                while let Some(end) = op.check_whether_slice_content_to_fit_in_size(
+                    MAX_BLOCK_SIZE.saturating_sub(estimated_size),
+                ) {
                     // The new op can take the rest of the room
                     let new = op.slice(0, end);
                     new_change.ops.push(new);
