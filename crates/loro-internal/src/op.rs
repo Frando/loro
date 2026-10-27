@@ -105,27 +105,32 @@ impl Op {
     /// If the estimated storage size of the content is greater than the given size,
     /// return the length of the content that makes the estimated storage size equal to the given size.
     /// Otherwise, return None.
+    ///
+    /// Also None when the op cannot be sliced to fit: ops other than inserts
+    /// have a small constant size, and a size too small for a single atom
+    /// keeps the op whole. A block then exceeds its target size.
     pub(crate) fn check_whether_slice_content_to_fit_in_size(&self, size: usize) -> Option<usize> {
         if self.estimate_storage_size() <= size {
             return None;
         }
 
-        match &self.content {
+        let len = match &self.content {
             InnerContent::List(l) => match l {
                 crate::container::list::list_op::InnerListOp::Insert { .. } => {
                     if matches!(self.container.get_type(), ContainerType::Text) {
-                        Some(size.min(self.atom_len()))
+                        size.min(self.atom_len())
                     } else {
-                        Some((size / 4).min(self.atom_len()))
+                        (size / 4).min(self.atom_len())
                     }
                 }
                 crate::container::list::list_op::InnerListOp::InsertText { .. } => {
-                    Some(size.min(self.atom_len()))
+                    size.min(self.atom_len())
                 }
-                _ => unreachable!(),
+                _ => return None,
             },
-            _ => unreachable!(),
-        }
+            _ => return None,
+        };
+        (len > 0).then_some(len)
     }
 }
 

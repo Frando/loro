@@ -316,3 +316,30 @@ fn backward_timestamps_import() {
         }
     }
 }
+
+/// Honest input: a change that depends on more concurrent changes than
+/// fit a change block (here 1,100) underflowed the room left in the block
+/// when the change store split it, on commit and on import.
+#[test]
+fn a_change_with_more_deps_than_fit_a_block_imports() {
+    let base = LoroDoc::new();
+    for p in 0..1100u64 {
+        let d = LoroDoc::new();
+        d.set_peer_id(p + 10).unwrap();
+        d.get_map("m").insert(&format!("k{p}"), 1).unwrap();
+        d.commit();
+        base.import(&d.export(ExportMode::all_updates()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(base.oplog_frontiers().len(), 1100);
+    base.set_peer_id(1).unwrap();
+    base.get_map("m").insert("merge", 1).unwrap();
+    base.get_text("t").insert(0, &"x".repeat(10_000)).unwrap();
+    base.commit();
+    for mode in [ExportMode::all_updates(), ExportMode::Snapshot] {
+        let y = LoroDoc::new();
+        y.import(&base.export(mode).unwrap()).unwrap();
+        assert_eq!(y.get_deep_value(), base.get_deep_value());
+        assert_eq!(y.oplog_vv(), base.oplog_vv());
+    }
+}
