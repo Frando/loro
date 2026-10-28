@@ -26,6 +26,11 @@ use std::{
 pub(crate) struct LoadAllFlag;
 type ParentResolver = dyn Fn(ContainerID) -> Option<ContainerID> + Send + Sync + 'static;
 
+/// The most parent links a walk up the container tree follows. Depths are
+/// `u16`, so an honest chain is never longer; a longer walk is in a cycle
+/// that crafted ops linked.
+pub(crate) const MAX_PARENT_WALK: usize = u16::MAX as usize;
+
 #[derive(Default)]
 struct ArenaContainers {
     container_idx_to_id: Vec<ContainerID>,
@@ -161,7 +166,9 @@ impl ArenaContainers {
                 // be assembling parent edges from KV snapshots, so resolving depth here would make
                 // arena -> KV and KV -> arena lock orders coexist.
                 if let Some(d) = self.depth[p.to_index() as usize] {
-                    self.depth[child.to_index() as usize] = NonZeroU16::new(d.get() + 1);
+                    // A depth past `u16::MAX` is unknown, like an unresolved one.
+                    self.depth[child.to_index() as usize] =
+                        d.get().checked_add(1).and_then(NonZeroU16::new);
                 } else {
                     self.depth[child.to_index() as usize] = None;
                 }
@@ -172,11 +179,41 @@ impl ArenaContainers {
         }
     }
 
+    /// The depth of `target`, or `None` when it is unknown.
+    ///
+    /// Walks up the parent links iteratively. A chain longer than `u16::MAX`
+    /// or a cycle (only crafted ops can link containers into one) has no
+    /// depth.
     fn get_depth(&mut self, target: ContainerIdx) -> Option<NonZeroU16> {
-        if let Some(d) = self.depth[target.to_index() as usize] {
-            return Some(d);
-        }
+        let mut chain = Vec::new();
+        let mut cur = target;
+        let base = loop {
+            if let Some(d) = self.depth[cur.to_index() as usize] {
+                break Some(d);
+            }
+            if chain.len() >= u16::MAX as usize {
+                return None;
+            }
+            chain.push(cur);
+            match self.parent_for_depth(cur)? {
+                Some(p) => cur = p,
+                None => break None,
+            }
+        };
 
+        // `chain` runs from `target` up to the topmost container without a
+        // cached depth; `base` is the depth of that container's parent.
+        let mut d = base.map_or(0, |d| d.get());
+        for idx in chain.into_iter().rev() {
+            d = d.checked_add(1)?;
+            self.depth[idx.to_index() as usize] = NonZeroU16::new(d);
+        }
+        self.depth[target.to_index() as usize]
+    }
+
+    /// The parent of `target` for [`Self::get_depth`]: `Some(None)` for a
+    /// top-level root, `None` when it cannot be resolved.
+    fn parent_for_depth(&mut self, target: ContainerIdx) -> Option<Option<ContainerIdx>> {
         let parent: Option<ContainerIdx> = if let Some(p) = self.parents.get(&target) {
             *p
         } else {
@@ -217,12 +254,7 @@ impl ArenaContainers {
             }
         };
 
-        let d = match parent {
-            Some(p) => NonZeroU16::new(self.get_depth(p)?.get() + 1),
-            None => NonZeroU16::new(1),
-        };
-        self.depth[target.to_index() as usize] = d;
-        d
+        Some(parent)
     }
 
     fn container_id(&self, idx: ContainerIdx) -> Option<ContainerID> {
@@ -475,10 +507,17 @@ impl SharedArena {
     /// Call `f` on each ancestor of `container`, including `container` itself.
     ///
     /// f(ContainerIdx, is_first)
+    /// Stops after [`MAX_PARENT_WALK`] containers, so a parent cycle from
+    /// crafted ops cannot loop forever.
     pub fn with_ancestors(&self, container: ContainerIdx, mut f: impl FnMut(ContainerIdx, bool)) {
         let mut container = Some(container);
         let mut is_first = true;
+        let mut steps = 0;
         while let Some(c) = container {
+            if steps >= MAX_PARENT_WALK {
+                break;
+            }
+            steps += 1;
             f(c, is_first);
             is_first = false;
             container = self.get_parent(c)
@@ -794,6 +833,25 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    /// Ops of an import can nest containers past `u16::MAX` levels; the
+    /// depth then is unknown instead of overflowing.
+    #[test]
+    fn depth_past_u16_max_is_unknown() {
+        let arena = SharedArena::new();
+        let mut parent =
+            arena.register_container(&ContainerID::new_root("root", ContainerType::Map));
+        arena.set_parent(parent, None);
+        for counter in 0..u16::MAX as i32 + 1 {
+            let child = arena.register_container(&ContainerID::new_normal(
+                loro_common::ID::new(1, counter),
+                ContainerType::Map,
+            ));
+            arena.set_parent(child, Some(parent));
+            parent = child;
+        }
+        assert_eq!(arena.get_depth(parent), None);
+    }
 
     /// When a non-mergeable child is registered, then later asks for its depth and the parent
     /// resolver yields a mergeable cid, the mergeable parent must be registered through the

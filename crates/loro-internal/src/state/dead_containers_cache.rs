@@ -35,6 +35,10 @@ impl DocState {
         let mut idx = idx;
         let mut depends_on_mergeable_edge = false;
         let is_deleted = loop {
+            if visited.len() > crate::arena::MAX_PARENT_WALK {
+                // A parent cycle (from crafted ops) never reaches a root.
+                break true;
+            }
             let id = self.arena.idx_to_id(idx).unwrap();
             if id.is_mergeable() {
                 depends_on_mergeable_edge = true;
