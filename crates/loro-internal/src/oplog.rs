@@ -1,5 +1,6 @@
 mod change_store;
 pub(crate) mod loro_dag;
+mod op_check;
 mod pending_changes;
 
 use crate::sync::{AtomicUsize, Mutex};
@@ -342,7 +343,8 @@ impl OpLog {
     /// - the lamports it can get fit a [`Lamport`]: a change's lamport is
     ///   one more than its largest dep's, so after this import no lamport
     ///   exceeds the largest lamport held plus every imported and pending
-    ///   atom.
+    ///   atom;
+    /// - its op contents pass [`Self::check_remote_ops`].
     ///
     /// Honest changes have all these properties. The whole import is refused
     /// on the first violation, so nothing is mutated.
@@ -401,7 +403,7 @@ impl OpLog {
                     .into_boxed_str(),
             ));
         }
-        Ok(())
+        self.check_remote_ops(changes)
     }
 
     pub(crate) fn preflight_import_changes(&self, changes: &[Change]) -> ImportChangesPreflight {
