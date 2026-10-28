@@ -131,3 +131,35 @@ fn export_import_edit_export() {
     assert_eq!(new_new_store.get(b"b99"), Some(Bytes::from_static(b"2")));
     assert_eq!(new_new_store.get(b"a"), Some(Bytes::from_static(b"2")));
 }
+
+/// A block whose checksum matches but whose body does not decode is an
+/// import error. Blocks are read lazily, and a lazy read of such a block
+/// used to panic.
+#[test]
+fn import_rejects_an_undecodable_block_with_a_valid_checksum() {
+    use loro_kv_store::compress::CompressionType;
+    use std::ops::Bound;
+
+    let mut store = MemKvStore::new(MemKvConfig::default().compression_type(CompressionType::None));
+    store.set(b"a", Bytes::from_static(b"1"));
+    store.set(b"b", Bytes::from_static(b"2"));
+    let mut bytes = store.export_all().to_vec();
+
+    // One block: it starts after the magic number and the schema version and
+    // ends at the meta offset, the last u32 of the table.
+    let n = bytes.len();
+    let meta_offset = u32::from_le_bytes(bytes[n - 4..].try_into().unwrap()) as usize;
+    let (start, end) = (5, meta_offset);
+    // The block body ends with the number of entries (u16), then the checksum.
+    bytes[end - 6..end - 4].copy_from_slice(&0u16.to_le_bytes());
+    let checksum = xxhash_rust::xxh32::xxh32(&bytes[start..end - 4], u32::from_le_bytes(*b"LORO"));
+    bytes[end - 4..end].copy_from_slice(&checksum.to_le_bytes());
+
+    let mut imported = MemKvStore::new(MemKvConfig::default());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ok = imported.import_all(Bytes::from(bytes)).is_ok();
+        let _ = imported.scan(Bound::Unbounded, Bound::Unbounded).count();
+        ok
+    }));
+    assert_eq!(result.ok(), Some(false));
+}

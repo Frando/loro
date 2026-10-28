@@ -277,14 +277,16 @@ impl MemKvStore {
         ans
     }
 
-    /// Import a serialized store, verifying every block's checksum. Can be
-    /// called multiple times; later imports override earlier keys.
+    /// Import a serialized store, verifying every block's checksum and that
+    /// every block decodes with its keys in order. Blocks are read lazily
+    /// later, and a lazy read cannot return an error. Can be called multiple
+    /// times; later imports override earlier keys.
     pub fn import_all(&mut self, bytes: Bytes) -> Result<(), String> {
         if bytes.is_empty() {
             return Ok(());
         }
 
-        let ss_table = SsTable::import_all(bytes, false).map_err(|e| e.to_string())?;
+        let ss_table = SsTable::import_all(bytes, true).map_err(|e| e.to_string())?;
         self.ss_table.push(ss_table);
         Ok(())
     }
