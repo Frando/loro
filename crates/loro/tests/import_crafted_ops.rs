@@ -115,6 +115,12 @@ fn mark(start: u32, end: u32) -> Value {
     json!({"type":"mark","start":start,"end":end,"style_key":"b","style_value":true,"info":132})
 }
 
+fn assert_import_error(json: &str) {
+    for r in import_both(json) {
+        assert!(r.is_err(), "expected an import error");
+    }
+}
+
 fn assert_imports(json: &str) {
     for r in import_both(json) {
         r.unwrap();
@@ -409,5 +415,104 @@ fn movable_list_move_of_a_text_op() {
     assert_attached_import_fails(&[(
         "cid:root-ml:MovableList",
         json!({"type":"move","from":0,"to":1,"elem_id":"L0@0"}),
+    )]);
+}
+
+// Op contents checked before the ops reach the oplog.
+
+#[test]
+fn a_mark_with_start_not_below_end_is_an_import_error() {
+    let base = base_doc();
+    for (start, end) in [(4, 1), (2, 2)] {
+        let json = crafted(
+            &base,
+            &[(T, mark(start, end)), (T, json!({"type":"mark_end"}))],
+            &[],
+        );
+        assert_import_error(&json);
+    }
+}
+
+#[test]
+fn a_style_end_without_its_style_start_is_an_import_error() {
+    let base = base_doc();
+    let end = json!({"type":"mark_end"});
+    let cases: Vec<Vec<(&str, Value)>> = vec![
+        vec![(T, end.clone())],
+        vec![(T, mark(0, 2)), (T, end.clone()), (T, end.clone())],
+        vec![(T, mark(0, 2)), ("cid:12@0:Text", end.clone())],
+        vec![
+            (T, mark(0, 2)),
+            (T, json!({"type":"insert","pos":0,"text":"ab"})),
+        ],
+    ];
+    for ops in cases {
+        assert_import_error(&crafted(&base, &ops, &[]));
+    }
+}
+
+/// A change of peer 2 that starts with a `StyleEnd` arrives before the
+/// change with the op before it, which is not a `StyleStart` of the same
+/// text. The check before the oplog cannot see that op, so the change is
+/// parked; when the op arrives, the end has no effect (it failed an
+/// `unreachable!` in the diff calculator).
+
+#[test]
+fn positions_and_delete_spans_out_of_range_are_import_errors() {
+    let base = base_doc();
+    let big = i64::from(u32::MAX);
+    let cases: Vec<(&str, Value)> = vec![
+        (T, json!({"type":"insert","pos":big,"text":"ab"})),
+        (L, json!({"type":"insert","pos":big,"value":[1]})),
+        (
+            T,
+            json!({"type":"delete","pos":-5,"len":2,"start_id":"0@0"}),
+        ),
+        (
+            T,
+            json!({"type":"delete","pos":1,"len":-4,"start_id":"1@0"}),
+        ),
+        (
+            L,
+            json!({"type":"delete","pos":-3,"len":-2,"start_id":"7@0"}),
+        ),
+    ];
+    for op in cases {
+        assert_import_error(&crafted(&base, &[op], &[]));
+    }
+}
+
+#[test]
+fn an_op_in_a_container_its_peer_creates_later_is_an_import_error() {
+    let base = base_doc();
+    let cases: Vec<(&str, Value)> = vec![
+        ("cid:5@1:Map", json!({"type":"insert","key":"a","value":1})),
+        // The map would be its own child.
+        (
+            "cid:0@1:Map",
+            json!({"type":"insert","key":"a","value":"\u{1f99c}:cid:0@1:Map"}),
+        ),
+        (
+            "cid:0@1:List",
+            json!({"type":"insert","pos":0,"value":["\u{1f99c}:cid:0@1:List"]}),
+        ),
+    ];
+    for op in cases {
+        assert_import_error(&crafted(&base, &[op], &[]));
+    }
+}
+
+// Container parent cycles across peers.
+
+/// Peer 2 creates map A in peer 3's map B, and peer 3 creates B in A. Each
+/// peer's ops are valid alone; together the parent links form a cycle. Walks
+/// up the parents used to recurse or loop forever (a stack overflow aborted
+/// the process); now the containers have no depth and count as deleted.
+
+#[test]
+fn generic_btree_list_delete_huge_len() {
+    assert_attached_import_fails(&[(
+        L,
+        json!({"type":"delete","pos":0,"len":2147483646,"start_id":"7@0"}),
     )]);
 }
