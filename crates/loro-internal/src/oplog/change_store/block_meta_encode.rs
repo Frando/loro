@@ -230,7 +230,10 @@ pub(crate) fn decode_changes_header(
     let (deps_len, bytes) = dep_len_decoder
         .take_n_finalize(n_changes)
         .map_err(|_| LoroError::DecodeError("Decode block error: invalid deps".into()))?;
-    let other_dep_num = deps_len.iter().sum::<usize>();
+    let other_dep_num = deps_len
+        .iter()
+        .try_fold(0usize, |acc, len| acc.checked_add(*len))
+        .ok_or_else(|| LoroError::DecodeError("Decode block error: invalid deps".into()))?;
     let dep_peer_decoder = AnyRleDecoder::<usize>::new(bytes);
     let (dep_peers, bytes) = dep_peer_decoder
         .take_n_finalize(other_dep_num)
@@ -302,7 +305,11 @@ pub(crate) fn decode_changes_header(
             .checked_add(counter_len)
             .ok_or_else(|| LoroError::DecodeError("Decode block error: counter overflow".into()))?,
     );
-    debug_assert!(rest.is_empty());
+    if !rest.is_empty() {
+        return Err(LoroError::DecodeError(
+            "Decode block error: trailing bytes in header".into(),
+        ));
+    }
 
     Ok(ChangesBlockHeader {
         peer: peers[0],
