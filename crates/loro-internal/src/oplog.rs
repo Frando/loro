@@ -432,21 +432,21 @@ impl OpLog {
             }
 
             ans.applies_to_dag = true;
-            if change.ops.iter().any(|op| {
-                matches!(
-                    op.container.get_type(),
-                    ContainerType::List | ContainerType::Tree
-                )
-            }) {
+            if change
+                .ops
+                .iter()
+                .any(|op| crate::state::state_apply_can_fail(op.container.get_type()))
+            {
                 ans.needs_state_apply_rollback = true;
             }
         }
 
         // Any newly applied change can unlock pending changes whose ops are not
         // visible in `changes`, so include pending in the rollback decision.
-        // Keep this narrow: text/map-only pending changes cannot return a
-        // state-apply error, and forcing rollback there adds lock traffic to
-        // small sync/import workloads.
+        // Keep this narrow: changes of containers whose states accept every
+        // diff (see `state_apply_can_fail`) cannot return a state-apply error,
+        // and forcing rollback there adds lock traffic to small sync/import
+        // workloads.
         //
         // Scan pending last, and only when it can still change the answer:
         // `has_state_apply_rollback_ops` walks every parked change and every op in

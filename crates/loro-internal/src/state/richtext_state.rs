@@ -572,6 +572,33 @@ impl ContainerState for RichtextState {
         Diff::Text(ans)
     }
 
+    /// Checks that the diff retains and deletes no more entities than the
+    /// state holds. Diffs computed from crafted remote ops can point past the
+    /// end, which the state's trees assert against.
+    fn validate_diff(&self, diff: &InternalDiff) -> LoroResult<()> {
+        let InternalDiff::RichtextRaw(delta) = diff else {
+            return Err(LoroError::internal("text state got a non-text diff"));
+        };
+        let len = match &self.state {
+            LazyLoad::Src(loader) => loader.entity_index,
+            LazyLoad::Dst(state) => state.len_entity(),
+        };
+        let mut consumed = 0usize;
+        for span in delta.iter() {
+            let n = match span {
+                loro_delta::DeltaItem::Retain { len, .. } => *len,
+                loro_delta::DeltaItem::Replace { delete, .. } => *delete,
+            };
+            consumed = consumed.saturating_add(n);
+        }
+        if consumed > len {
+            return Err(LoroError::internal(format!(
+                "text diff covers {consumed} entities but the state only has {len}",
+            )));
+        }
+        Ok(())
+    }
+
     fn apply_diff(&mut self, diff: InternalDiff, _ctx: DiffApplyContext) -> LoroResult<()> {
         self.update_version();
         let InternalDiff::RichtextRaw(richtext) = diff else {

@@ -71,6 +71,16 @@ pub(crate) fn fail_next_import_state_apply_for_test() {
     FAIL_NEXT_IMPORT_STATE_APPLY.with(|fail| fail.set(true));
 }
 
+/// Whether applying a diff to a container of this kind can fail validation
+/// (`ContainerState::validate_diff`), so that an import touching it needs a
+/// rollback scope.
+pub(crate) fn state_apply_can_fail(kind: ContainerType) -> bool {
+    matches!(
+        kind,
+        ContainerType::List | ContainerType::Tree | ContainerType::Text
+    )
+}
+
 fn visible_container_value_is_empty(kind: ContainerType, value: &LoroValue) -> bool {
     match kind {
         ContainerType::Text => value.as_string().is_some_and(|value| value.is_empty()),
