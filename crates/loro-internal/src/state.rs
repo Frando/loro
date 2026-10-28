@@ -1958,7 +1958,7 @@ impl DocState {
         }
 
         let mut idx = self.arena.id_to_idx(id).unwrap();
-        loop {
+        for _ in 0..crate::arena::MAX_PARENT_WALK {
             let id = self.arena.idx_to_id(idx).unwrap();
             if let Some(parent_idx) = self.arena.get_parent(idx) {
                 if !self.contains_logical_child(parent_idx, &id) {
@@ -1973,6 +1973,9 @@ impl DocState {
                 return false;
             }
         }
+
+        // A parent cycle (from crafted ops) never reaches a root.
+        false
     }
 
     // the container may be override, so it may return None
@@ -1980,6 +1983,10 @@ impl DocState {
         let mut ans = Vec::new();
         let mut idx = idx;
         loop {
+            if ans.len() >= crate::arena::MAX_PARENT_WALK {
+                // A parent cycle (from crafted ops) never reaches a root.
+                return None;
+            }
             let id = self.arena.idx_to_id(idx).unwrap();
             if let Some(parent_idx) = self.arena.get_parent(idx) {
                 let Some(prop) = self.get_logical_child_index(parent_idx, &id) else {
