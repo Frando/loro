@@ -311,8 +311,12 @@ pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Result<Snapshot, LoroEncod
         let latest = oplog.frontiers().clone();
         drop(state);
         drop(oplog);
+        // Fails when crafted remote ops give a state diff that the state
+        // refuses. The state then stays at its version.
         doc._checkout_without_emitting(&latest, false, true)
-            .unwrap();
+            .map_err(|e| {
+                LoroEncodeError::internal(format!("cannot compute the latest state: {e}"))
+            })?;
         state = doc.app_state().lock();
     }
     // Every container referenced by applied ops/diffs already has a store entry
