@@ -992,6 +992,21 @@ mod mut_inner_kv {
 
             let id = change.id;
             let mut inner = self.inner.lock();
+            if id.counter > 0 {
+                let last_is_loaded = inner
+                    .mem_parsed_kv
+                    .range(..id)
+                    .next_back()
+                    .is_some_and(|(_, b)| b.peer == id.peer && b.counter_range.1 == id.counter);
+                if !last_is_loaded {
+                    // Blocks load lazily, so after a snapshot import only an
+                    // older block of the peer may be in memory while its last
+                    // block is still in the kv store. Load the last one.
+                    drop(inner);
+                    self.ensure_id_lte(id.inc(-1));
+                    inner = self.inner.lock();
+                }
+            }
 
             // try to merge with previous block
             if let Some((_id, block)) = inner.mem_parsed_kv.range_mut(..id).next_back() {
