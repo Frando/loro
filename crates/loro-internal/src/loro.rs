@@ -1632,8 +1632,12 @@ impl LoroDoc {
             return;
         }
 
-        self._checkout_to_latest_without_commit(true)
-            .expect("checkout to oplog frontiers should succeed");
+        // The state rejects diffs that crafted remote ops produce (positions
+        // past the end, unknown elements) before it changes. The document
+        // then stays detached at its old version instead of panicking.
+        if let Err(e) = self._checkout_to_latest_without_commit(true) {
+            tracing::warn!("checkout_to_latest failed, the document stays detached: {e}");
+        }
         self.emit_events();
         drop(_guard);
         self.renew_txn_if_auto_commit(options);
@@ -1805,7 +1809,7 @@ impl LoroDoc {
         self.set_detached(true);
         let (diff, diff_mode) =
             calc.calc_diff_internal(&oplog, &before, &state.frontiers, after, &frontiers, None);
-        state.apply_diff(
+        if let Err(e) = state.apply_diff(
             InternalDocDiff {
                 origin,
                 diff: Cow::Owned(diff),
@@ -1813,7 +1817,12 @@ impl LoroDoc {
                 new_version: Cow::Owned(frontiers.clone()),
             },
             diff_mode,
-        )?;
+        ) {
+            // The state refused the diff and stays at its version, but the
+            // calculator's trackers moved to `frontiers`: drop them.
+            *calc = DiffCalculator::new(true);
+            return Err(e);
+        }
 
         Ok(())
     }

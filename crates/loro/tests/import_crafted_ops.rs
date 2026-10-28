@@ -88,10 +88,16 @@ fn import_both(json: &str) -> Vec<Result<(), String>> {
             .import_json_updates(json)
             .map(|_| ())
             .map_err(|e| e.to_string());
+        // A detached document whose history holds ops that the state
+        // refuses stays detached, and its snapshot export fails.
         doc.checkout_to_latest();
         let _ = doc.get_deep_value();
-        let snapshot = doc.export(ExportMode::Snapshot).unwrap();
-        LoroDoc::new().import(&snapshot).unwrap();
+        match doc.export(ExportMode::Snapshot) {
+            Ok(snapshot) => {
+                LoroDoc::new().import(&snapshot).unwrap();
+            }
+            Err(_) => assert!(detached && doc.is_detached()),
+        }
         if !doc.is_detached() {
             doc.get_text("t").insert(0, "z").unwrap();
             doc.commit();
@@ -102,6 +108,7 @@ fn import_both(json: &str) -> Vec<Result<(), String>> {
 }
 
 const T: &str = "cid:root-t:Text";
+const L: &str = "cid:root-l:List";
 const TR: &str = "cid:root-tr:Tree";
 
 fn mark(start: u32, end: u32) -> Value {
@@ -340,4 +347,20 @@ fn a_parked_style_end_without_its_style_start_has_no_effect() {
             LoroDoc::new().import(&snapshot).unwrap();
         }
     }
+}
+
+// Ops whose positions or elements the state cannot resolve. Their diffs
+// failed asserts in the states and the movable list history cache. The
+// attached import is now an error and rolls back; a detached document keeps
+// them in its history, stays detached on checkout, and does not panic.
+
+fn assert_attached_import_fails(ops: &[(&str, Value)]) {
+    let json = crafted(&base_doc(), ops, &[]);
+    let results = import_both(&json);
+    assert!(results[0].is_err(), "the attached import should fail");
+}
+
+#[test]
+fn checkout_to_latest_list_insert_past_the_end() {
+    assert_attached_import_fails(&[(L, json!({"type":"insert","pos":100,"value":[1]}))]);
 }
