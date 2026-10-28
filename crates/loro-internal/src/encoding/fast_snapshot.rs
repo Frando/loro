@@ -437,6 +437,51 @@ mod tests {
         }
     }
 
+    /// A snapshot imported into a non-empty document is read as updates; a
+    /// change block that does not decode fails the import. It used to be
+    /// skipped, so the other blocks imported without it.
+    #[test]
+    fn snapshot_as_update_with_a_corrupt_change_block_is_an_error() {
+        let source = LoroDoc::new_auto_commit();
+        source.set_peer_id(1).unwrap();
+        for i in 0..32 {
+            source.set_next_commit_message(&i.to_string());
+            source.get_map("m").insert(&i.to_string(), i).unwrap();
+            source.commit_then_renew();
+        }
+        let sections = snapshot_sections(&source);
+        let kv = KvWrapper::new_mem();
+        kv.import(sections.oplog_bytes).unwrap();
+        let blocks: Vec<_> = kv
+            .scan_all_keys()
+            .into_iter()
+            .filter(|k| k.len() == 12)
+            .collect();
+        assert!(blocks.len() >= 2, "the history spans several blocks");
+        // The first block; the last block of each peer is read by the import
+        // itself in test builds.
+        kv.insert(&blocks[0], Bytes::from_static(b"not a change block"));
+        let snapshot = Snapshot {
+            oplog_bytes: kv.export(),
+            state_bytes: sections.state_bytes,
+            shallow_root_state_bytes: sections.shallow_root_state_bytes,
+        };
+        let bytes = super::super::encode_with(super::super::EncodeMode::FastSnapshot, &mut |ans| {
+            _encode_snapshot(&snapshot, ans);
+            Ok(())
+        })
+        .unwrap();
+
+        let target = LoroDoc::new_auto_commit();
+        target.set_peer_id(2).unwrap();
+        target.get_map("m").insert("own", 1).unwrap();
+        target.commit_then_renew();
+        assert!(target.import(&bytes).is_err());
+        assert_eq!(target.oplog_vv().get(&1), None);
+        target.get_map("m").insert("after", 2).unwrap();
+        target.commit_then_renew();
+    }
+
     #[test]
     fn decode_updates_rejects_truncated_block() {
         let doc = LoroDoc::new();
