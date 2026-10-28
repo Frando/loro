@@ -364,3 +364,18 @@ fn assert_attached_import_fails(ops: &[(&str, Value)]) {
 fn checkout_to_latest_list_insert_past_the_end() {
     assert_attached_import_fails(&[(L, json!({"type":"insert","pos":100,"value":[1]}))]);
 }
+
+#[test]
+fn richtext_state_insert_past_the_end() {
+    assert_attached_import_fails(&[(T, json!({"type":"insert","pos":100,"text":"ab"}))]);
+}
+
+#[test]
+fn richtext_state_delete_past_the_end() {
+    assert_attached_import_fails(&[(T, json!({"type":"delete","pos":3,"len":5,"start_id":"3@0"}))]);
+}
+
+#[test]
+fn richtext_state_mark_past_the_end() {
+    assert_attached_import_fails(&[(T, mark(0, 1000)), (T, json!({"type":"mark_end"}))]);
+}
