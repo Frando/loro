@@ -1060,16 +1060,21 @@ impl RichtextDiffCalculator {
     fn style_for_end_anchor(oplog: &OpLog, op: &RichOp) -> Option<(StyleOp, usize)> {
         let style_start_id = op.id().inc(-1);
         if let Some(start_op) = oplog.get_op_that_includes(style_start_id) {
-            let InnerListOp::StyleStart {
+            // A crafted `StyleEnd` that was parked before the op before it
+            // arrived can follow any op: it then has no style.
+            let Some(InnerListOp::StyleStart {
                 start: _,
                 end,
                 key,
                 value,
                 info,
-            } = start_op.content.as_list().unwrap()
+            }) = start_op.content.as_list()
             else {
-                unreachable!()
+                return None;
             };
+            if start_op.container != op.raw_op().container {
+                return None;
+            }
 
             Some((
                 StyleOp {
@@ -1292,8 +1297,10 @@ impl RichtextDiffCalculator {
                             RichtextChunk::new_style_anchor(style_id as u32, AnchorType::End),
                         );
                     } else {
+                        // None for a crafted `StyleEnd` without its
+                        // `StyleStart` (see `style_for_end_anchor`): no effect.
                         let Some((style, end)) = Self::style_for_end_anchor(oplog, &op) else {
-                            panic!("Unhandled checkout case")
+                            return;
                         };
                         styles.push((style, end));
                         let style_id = styles.len() - 1;
@@ -1615,19 +1622,24 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                         );
                     }
                     InnerListOp::StyleEnd => {
-                        let (style_op, pos) = match last_style_start.take() {
-                            Some((style_op, pos)) => (style_op, pos),
-                            None => {
-                                let Some((style_op, pos)) = Self::style_for_end_anchor(oplog, &op)
-                                else {
-                                    panic!("Unhandled checkout case")
-                                };
-
-                                (Arc::new(style_op), pos as u32)
+                        let start_cnt = op.id_start().counter - 1;
+                        let found = match last_style_start.take() {
+                            Some((style_op, pos))
+                                if style_op.peer == op.peer && style_op.cnt == start_cnt =>
+                            {
+                                Some((style_op, pos))
+                            }
+                            other => {
+                                *last_style_start = other;
+                                Self::style_for_end_anchor(oplog, &op)
+                                    .map(|(style_op, pos)| (Arc::new(style_op), pos as u32))
                             }
                         };
-                        assert_eq!(style_op.peer, op.peer);
-                        assert_eq!(style_op.cnt, op.id_start().counter - 1);
+                        // None for a crafted `StyleEnd` without its
+                        // `StyleStart` (see `style_for_end_anchor`): no effect.
+                        let Some((style_op, pos)) = found else {
+                            return;
+                        };
                         diff.insert_value(
                             pos as usize + 1,
                             RichtextStateChunk::new_style(style_op, AnchorType::End),

@@ -101,7 +101,12 @@ fn import_both(json: &str) -> Vec<Result<(), String>> {
     results
 }
 
+const T: &str = "cid:root-t:Text";
 const TR: &str = "cid:root-tr:Tree";
+
+fn mark(start: u32, end: u32) -> Value {
+    json!({"type":"mark","start":start,"end":end,"style_key":"b","style_value":true,"info":132})
+}
 
 fn assert_imports(json: &str) {
     for r in import_both(json) {
@@ -285,4 +290,54 @@ fn honest_tree_edits_still_apply() {
         x.get_tree("tr").parent(TreeID::new(1, 15)),
         Some(loro::TreeParentId::Node(n))
     );
+}
+
+// Style anchors.
+
+/// A change of peer 2 that starts with a `StyleEnd` arrives before the
+/// change with the op before it, which is not a `StyleStart` of the same
+/// text. The check before the oplog cannot see that op, so the change is
+/// parked; when the op arrives, the end has no effect (it failed an
+/// `unreachable!` in the diff calculator).
+#[test]
+fn a_parked_style_end_without_its_style_start_has_no_effect() {
+    let base = base_doc();
+    let firsts: Vec<(&str, Value)> = vec![
+        (T, json!({"type":"insert","pos":0,"text":"x"})),
+        ("cid:12@0:Text", mark(0, 1)),
+    ];
+    for first in firsts {
+        let json = crafted(&base, std::slice::from_ref(&first), &[]);
+        let mut v: Value = serde_json::from_str(&json).unwrap();
+        let mut end_change = v["changes"].as_array().unwrap().last().unwrap().clone();
+        end_change["id"] = json!("1@1");
+        end_change["deps"] = json!(["0@1"]);
+        end_change["lamport"] = json!(0);
+        end_change["ops"] = json!([{"container": T, "content": {"type":"mark_end"}, "counter": 1}]);
+        let first_change = v["changes"].as_array_mut().unwrap().pop().unwrap();
+        let mut parked = v.clone();
+        parked["changes"] = json!([end_change]);
+        let mut rest = v.clone();
+        rest["changes"].as_array_mut().unwrap().push(first_change);
+        for detached in [false, true] {
+            let doc = LoroDoc::new();
+            if detached {
+                doc.detach();
+            }
+            let status = doc.import_json_updates(parked.to_string()).unwrap();
+            assert!(status.pending.is_some());
+            doc.import_json_updates(rest.to_string()).unwrap();
+            doc.checkout_to_latest();
+            assert!(!doc.is_detached());
+            assert_eq!(doc.oplog_vv().get(&2), Some(&2));
+            let text = doc.get_text("t");
+            assert_eq!(text.get_richtext_value(), {
+                let honest = LoroDoc::new();
+                honest.import_json_updates(rest.to_string()).unwrap();
+                honest.get_text("t").get_richtext_value()
+            });
+            let snapshot = doc.export(ExportMode::Snapshot).unwrap();
+            LoroDoc::new().import(&snapshot).unwrap();
+        }
+    }
 }
