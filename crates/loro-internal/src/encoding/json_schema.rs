@@ -596,6 +596,7 @@ fn decode_changes(json: JsonSchema, arena: &SharedArena) -> LoroResult<Vec<Chang
             ops,
             commit_msg: msg.map(|x| x.into()),
         };
+        super::check_decoded_change(&change)?;
         ans.push(change);
     }
     Ok(ans)
