@@ -77,7 +77,10 @@ pub(crate) fn fail_next_import_state_apply_for_test() {
 pub(crate) fn state_apply_can_fail(kind: ContainerType) -> bool {
     matches!(
         kind,
-        ContainerType::List | ContainerType::Tree | ContainerType::Text
+        ContainerType::List
+            | ContainerType::MovableList
+            | ContainerType::Tree
+            | ContainerType::Text
     )
 }
 
