@@ -80,7 +80,7 @@ use serde::{Deserialize, Serialize};
 use serde_columnar::{columnar, AnyRleDecoder, DeltaOfDeltaDecoder, Itertools};
 use tracing::info;
 
-use super::block_meta_encode::decode_changes_header;
+use super::block_meta_encode::{check_delta_of_delta, decode_changes_header};
 use crate::arena::SharedArena;
 use crate::change::{Change, Timestamp};
 use crate::container::tree::tree_op;
@@ -560,6 +560,7 @@ pub fn decode_block(
     } = doc;
     let n_changes = n_changes as usize;
     let mut changes = Vec::with_capacity(n_changes);
+    check_delta_of_delta(&change_meta, n_changes)?;
     let timestamp_decoder = DeltaOfDeltaDecoder::<i64>::new(&change_meta)
         .map_err(|_| LoroError::DecodeDataCorruptionError)?;
     let (timestamps, bytes) = timestamp_decoder
@@ -713,8 +714,174 @@ mod test {
 
     use crate::encoding::value::{EncodedTreeMove, Value};
     use crate::{cursor::PosType, delta::DeltaValue, loro::ExportMode, LoroDoc};
+    use loro_common::LoroValue;
+    use serde_columnar::DeltaOfDeltaEncoder;
 
     use super::*;
+
+    // Crafted blocks that used to panic during decode. Each is wrapped in a
+    // fast-update blob and imported; the import must fail and leave the
+    // document usable.
+
+    const PEER: PeerID = 7;
+
+    /// A document of `PEER` with one change per entry of `msgs`; each change
+    /// is made by `edit` and carries its own commit message, so changes do
+    /// not merge.
+    fn doc_with_changes(msgs: &[&str], edit: impl Fn(&LoroDoc, usize)) -> LoroDoc {
+        let doc = LoroDoc::new_auto_commit();
+        doc.set_peer_id(PEER).unwrap();
+        for (i, msg) in msgs.iter().enumerate() {
+            doc.set_next_commit_message(msg);
+            edit(&doc, i);
+            doc.commit_then_renew();
+        }
+        doc
+    }
+
+    /// The only block of `doc`'s full update.
+    fn only_block(doc: &LoroDoc) -> Vec<u8> {
+        let bytes = doc.export(ExportMode::all_updates()).unwrap();
+        let mut body = &bytes[22..];
+        let len = leb128::read::unsigned(&mut body).unwrap() as usize;
+        assert_eq!(body.len(), len, "the update has one block");
+        body.to_vec()
+    }
+
+    /// A fast-update blob that holds `block`.
+    fn update_with_block(block: &[u8]) -> Vec<u8> {
+        let mut ans = b"loro".to_vec();
+        ans.extend([0; 16]);
+        ans.extend(crate::encoding::EncodeMode::FastUpdates.to_bytes());
+        leb128::write::unsigned(&mut ans, block.len() as u64).unwrap();
+        ans.extend_from_slice(block);
+        let checksum = xxhash_rust::xxh32::xxh32(&ans[20..], u32::from_le_bytes(*b"LORO"));
+        ans[16..20].copy_from_slice(&checksum.to_le_bytes());
+        ans
+    }
+
+    /// `doc`'s block rewritten by `f`, as a fast-update blob.
+    fn crafted_update(doc: &LoroDoc, f: impl FnOnce(&mut EncodedBlock)) -> Vec<u8> {
+        let block = only_block(doc);
+        let mut encoded: EncodedBlock = postcard::from_bytes(&block).unwrap();
+        f(&mut encoded);
+        update_with_block(&postcard::to_allocvec(&encoded).unwrap())
+    }
+
+    /// Imports `update` into `doc`, which must fail, and checks that the
+    /// document still takes local edits.
+    fn assert_import_fails(doc: &LoroDoc, update: &[u8]) {
+        assert!(doc.import(update).is_err());
+        doc.get_map("after").insert("still", "usable").unwrap();
+        doc.commit_then_renew();
+        assert_eq!(
+            doc.get_map("after").get("still"),
+            Some(LoroValue::from("usable"))
+        );
+    }
+
+    fn assert_import_fails_on_new_doc(update: &[u8]) {
+        let doc = LoroDoc::new_auto_commit();
+        assert_import_fails(&doc, update);
+    }
+
+    /// Big-endian bits, as `DeltaOfDeltaEncoder` writes them.
+    fn bits(bits: &str) -> Vec<u8> {
+        let bits: Vec<u8> = bits
+            .bytes()
+            .filter(|b| *b != b' ')
+            .map(|b| b - b'0')
+            .collect();
+        bits.chunks(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u8, |acc, (i, b)| acc | (b << (7 - i)))
+            })
+            .collect()
+    }
+
+    /// A delta-of-delta stream with `head`, `last_used_bit` and `body` bits.
+    fn delta_of_delta(head: Option<i64>, last_used_bit: u8, body: &[u8]) -> Vec<u8> {
+        let mut ans = postcard::to_allocvec(&head).unwrap();
+        ans.push(last_used_bit);
+        ans.extend_from_slice(body);
+        ans
+    }
+
+    fn two_map_changes() -> LoroDoc {
+        doc_with_changes(&["a", "b"], |doc, i| {
+            doc.get_map("m").insert(&i.to_string(), i as i64).unwrap();
+        })
+    }
+
+    /// Timestamps whose delta-of-delta stream claims more bits than it has
+    /// made the decoder index past its buffer.
+    #[test]
+    fn timestamps_with_an_overlong_bit_count_are_an_import_error() {
+        let doc = two_map_changes();
+        let update = crafted_update(&doc, |b| {
+            b.change_meta = Cow::Owned(delta_of_delta(Some(0), 0xff, &bits("1000 0000")));
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// A flag bit at the very end of the stream made the decoder unwrap a
+    /// missing read.
+    #[test]
+    fn timestamps_ending_in_a_flag_bit_are_an_import_error() {
+        let doc = two_map_changes();
+        let update = crafted_update(&doc, |b| {
+            b.change_meta = Cow::Owned(delta_of_delta(Some(0), 1, &bits("1000 0000")));
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// Deltas that overflow `i64` panicked in debug builds.
+    #[test]
+    fn timestamps_that_overflow_are_an_import_error() {
+        let doc = two_map_changes();
+        // Flags 1, 1, 1, 1, 1: a 64-bit delta of delta, here i64::MAX.
+        let stream = format!("11111 0{}", "1".repeat(63));
+        let mut body = bits(&stream);
+        let used = (stream.replace(' ', "").len() % 8) as u8;
+        let last_used_bit = if used == 0 { 8 } else { used };
+        if used == 0 {
+            body.push(0);
+        }
+        let update = crafted_update(&doc, |b| {
+            b.change_meta = Cow::Owned(delta_of_delta(Some(1), last_used_bit, &body));
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// `check_delta_of_delta` accepts what the encoder writes and agrees
+    /// with the decoder on it.
+    #[test]
+    fn delta_of_delta_check_accepts_encoded_streams() {
+        let cases: Vec<Vec<i64>> = vec![
+            vec![],
+            vec![5],
+            vec![0, 1, 2, 3],
+            vec![1_700_000_000_000, 1_700_000_000_007, 1_700_000_100_000, 3],
+            vec![i64::MIN / 4, i64::MAX / 4, 0, -1, 1 << 40],
+            (0..1000).map(|i| i * i * 37 % 1001).collect(),
+        ];
+        for values in cases {
+            let mut encoder = DeltaOfDeltaEncoder::new();
+            for v in &values {
+                encoder.append(*v).unwrap();
+            }
+            let bytes = encoder.finish().unwrap();
+            check_delta_of_delta(&bytes, values.len()).unwrap();
+            let (decoded, rest) = DeltaOfDeltaDecoder::<i64>::new(&bytes)
+                .unwrap()
+                .take_n_finalize(values.len())
+                .unwrap();
+            assert_eq!(decoded, values);
+            assert!(rest.is_empty());
+        }
+    }
 
     #[test]
     fn decode_block_rejects_corrupt_payload_without_panic() {

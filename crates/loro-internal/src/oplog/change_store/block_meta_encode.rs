@@ -87,6 +87,80 @@ pub(crate) fn encode_changes(
     (ans, meta)
 }
 
+/// Checks that `serde_columnar`'s `DeltaOfDeltaDecoder` can read `n` values
+/// from `bytes` without panicking.
+///
+/// The decoder of serde_columnar 0.3.14 trusts its input: a "last used bit"
+/// byte above 8 makes it index past the end of the buffer, a flag bit at the
+/// end of the stream makes it unwrap a missing read, and large deltas
+/// overflow its `i64` sums (a panic in debug builds). This walks the same bit
+/// layout with checked reads and checked arithmetic, so the decoder only
+/// sees streams it can decode or reject with an error. Each value but the
+/// head consumes at least one bit, so the walk is linear in `bytes`.
+pub(crate) fn check_delta_of_delta(bytes: &[u8], n: usize) -> LoroResult<()> {
+    let err = || LoroError::DecodeError("Decode block error: invalid delta of delta".into());
+    let (head, bytes): (Option<i64>, &[u8]) =
+        postcard::take_from_bytes(bytes).map_err(|_| err())?;
+    let Some((&last_used_bit, bits)) = bytes.split_first() else {
+        return Err(err());
+    };
+    if last_used_bit > 8 {
+        return Err(err());
+    }
+    let total_bits = match bits.len() {
+        0 => 0,
+        len => (len - 1) * 8 + last_used_bit as usize,
+    };
+    let mut pos = 0usize;
+    let mut read = |count: usize| -> Option<u64> {
+        if total_bits - pos < count {
+            return None;
+        }
+        let mut ans = 0u64;
+        for _ in 0..count {
+            let bit = (bits[pos / 8] >> (7 - pos % 8)) & 1;
+            ans = (ans << 1) | bit as u64;
+            pos += 1;
+        }
+        Some(ans)
+    };
+
+    let mut values = 0;
+    let mut prev_value = 0i64;
+    let mut prev_delta = 0i64;
+    if let Some(head) = head {
+        prev_value = head;
+        values += 1;
+    }
+    while values < n {
+        match read(1) {
+            // The decoder stops here and reports too few values.
+            None => return Ok(()),
+            Some(0) => {}
+            Some(_) => {
+                let (num_bits, bias) = if read(1).ok_or_else(err)? == 0 {
+                    (7, 63)
+                } else if read(1).ok_or_else(err)? == 0 {
+                    (9, 255)
+                } else if read(1).ok_or_else(err)? == 0 {
+                    (12, 2047)
+                } else if read(1).ok_or_else(err)? == 0 {
+                    (21, (1 << 20) - 1)
+                } else {
+                    (64, 0)
+                };
+                let delta_of_delta = (read(num_bits).ok_or_else(err)? as i64)
+                    .checked_sub(bias)
+                    .ok_or_else(err)?;
+                prev_delta = prev_delta.checked_add(delta_of_delta).ok_or_else(err)?;
+            }
+        }
+        prev_value = prev_value.checked_add(prev_delta).ok_or_else(err)?;
+        values += 1;
+    }
+    Ok(())
+}
+
 pub(crate) fn decode_changes_header(
     mut bytes: &[u8],
     n_changes: usize,
@@ -162,6 +236,7 @@ pub(crate) fn decode_changes_header(
         .take_n_finalize(other_dep_num)
         .map_err(|_| LoroError::DecodeError("Decode block error: invalid deps".into()))?;
     let mut deps_peers_iter = dep_peers.into_iter();
+    check_delta_of_delta(bytes, other_dep_num)?;
     let dep_counter_decoder = DeltaOfDeltaDecoder::<u32>::new(bytes)
         .map_err(|_| LoroError::DecodeError("Decode block error: invalid deps".into()))?;
     let (dep_counters, bytes) = dep_counter_decoder
@@ -207,6 +282,7 @@ pub(crate) fn decode_changes_header(
             .ok_or_else(|| LoroError::DecodeError("Decode block error: counter overflow".into()))?;
     }
 
+    check_delta_of_delta(bytes, n_changes.saturating_sub(1))?;
     let lamport_decoder = DeltaOfDeltaDecoder::new(bytes)
         .map_err(|_| LoroError::DecodeError("Decode block error: invalid lamport".into()))?;
     let (mut lamports, rest) = lamport_decoder
