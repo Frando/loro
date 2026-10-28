@@ -488,9 +488,20 @@ pub fn decode_block_range(
     let lamport_len = leb128::read::unsigned(&mut bytes).map_err(|e| {
         LoroError::DecodeError(format!("Failed to read lamport length: {e}").into_boxed_str())
     })? as Lamport;
+    let overflow = || LoroError::DecodeError("Decode block error: range overflow".into());
     Ok((
-        (counter_start, counter_start + counter_len),
-        (lamport_start, lamport_start + lamport_len),
+        (
+            counter_start,
+            counter_start
+                .checked_add(counter_len)
+                .ok_or_else(overflow)?,
+        ),
+        (
+            lamport_start,
+            lamport_start
+                .checked_add(lamport_len)
+                .ok_or_else(overflow)?,
+        ),
     ))
 }
 
@@ -715,7 +726,7 @@ mod test {
     use crate::encoding::value::{EncodedTreeMove, Value};
     use crate::{cursor::PosType, delta::DeltaValue, loro::ExportMode, LoroDoc};
     use loro_common::LoroValue;
-    use serde_columnar::DeltaOfDeltaEncoder;
+    use serde_columnar::{AnyRleEncoder, BoolRleEncoder, DeltaOfDeltaEncoder};
 
     use super::*;
 
@@ -881,6 +892,112 @@ mod test {
             assert_eq!(decoded, values);
             assert!(rest.is_empty());
         }
+    }
+
+    /// Builds a block header the way `encode_changes` does, from its parts.
+    fn header(
+        lengths: &[u64],
+        dep_self: &[bool],
+        deps_len: &[usize],
+        lamports: &[i64],
+        trailing: &[u8],
+    ) -> Vec<u8> {
+        let mut ans = Vec::new();
+        leb128::write::unsigned(&mut ans, 1).unwrap();
+        ans.extend(PEER.to_le_bytes());
+        for len in lengths {
+            leb128::write::unsigned(&mut ans, *len).unwrap();
+        }
+        let mut dep_self_encoder = BoolRleEncoder::new();
+        for b in dep_self {
+            dep_self_encoder.append(*b).unwrap();
+        }
+        ans.extend(dep_self_encoder.finish().unwrap());
+        let mut deps_len_encoder = AnyRleEncoder::<usize>::new();
+        for l in deps_len {
+            deps_len_encoder.append(*l).unwrap();
+        }
+        ans.extend(deps_len_encoder.finish().unwrap());
+        ans.extend(AnyRleEncoder::<u32>::new().finish().unwrap());
+        ans.extend(DeltaOfDeltaEncoder::new().finish().unwrap());
+        let mut lamport_encoder = DeltaOfDeltaEncoder::new();
+        for l in lamports {
+            lamport_encoder.append(*l).unwrap();
+        }
+        ans.extend(lamport_encoder.finish().unwrap());
+        ans.extend_from_slice(trailing);
+        ans
+    }
+
+    /// The honest header of `two_map_changes` decodes like the original, so
+    /// the crafted headers below differ only in what each test changes.
+    #[test]
+    fn crafted_header_matches_the_encoder() {
+        let doc = two_map_changes();
+        let block = only_block(&doc);
+        let encoded: EncodedBlock = postcard::from_bytes(&block).unwrap();
+        assert_eq!(
+            encoded.header.as_ref(),
+            header(&[1], &[false, true], &[0, 0], &[0], &[]).as_slice()
+        );
+    }
+
+    /// Dep counts whose sum overflows `usize` panicked in debug builds.
+    #[test]
+    fn dep_counts_that_overflow_are_an_import_error() {
+        let doc = two_map_changes();
+        let update = crafted_update(&doc, |b| {
+            b.header = Cow::Owned(header(&[1], &[false, true], &[usize::MAX, 1], &[0], &[]));
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// Trailing bytes after the header failed a debug assert.
+    #[test]
+    fn trailing_header_bytes_are_an_import_error() {
+        let doc = two_map_changes();
+        let update = crafted_update(&doc, |b| {
+            b.header = Cow::Owned(header(&[1], &[false, true], &[0, 0], &[0], &[0, 0]));
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// A mark whose end overflowed `u32` panicked in debug builds.
+    #[test]
+    fn a_mark_end_that_overflows_is_an_import_error() {
+        let doc = doc_with_changes(&["a"], |doc, _| {
+            let text = doc.get_text("t");
+            text.insert(0, "ab", PosType::Unicode).unwrap();
+            text.mark(0, 2, "bold", true.into(), PosType::Unicode)
+                .unwrap();
+        });
+        let update = crafted_update(&doc, |b| {
+            let mut ops: EncodedOps = serde_columnar::from_bytes(&b.ops).unwrap();
+            let mark = ops
+                .ops
+                .iter_mut()
+                .find(|op| matches!(ValueKind::from_u8(op.value_type), ValueKind::MarkStart))
+                .unwrap();
+            mark.prop = -1;
+            b.ops = Cow::Owned(serde_columnar::to_vec(&ops).unwrap());
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// `decode_block_range` reads the ranges of lazily loaded blocks; ends
+    /// that overflow are errors.
+    #[test]
+    fn block_ranges_that_overflow_are_errors() {
+        let mut bytes = Vec::new();
+        for v in [0, i32::MAX as u64, 1, 0, 1] {
+            leb128::write::unsigned(&mut bytes, v).unwrap();
+        }
+        assert!(decode_block_range(&bytes).is_err());
+        let mut bytes = Vec::new();
+        for v in [0, 0, 1, u32::MAX as u64, 1] {
+            leb128::write::unsigned(&mut bytes, v).unwrap();
+        }
+        assert!(decode_block_range(&bytes).is_err());
     }
 
     #[test]

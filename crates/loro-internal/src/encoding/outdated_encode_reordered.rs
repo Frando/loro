@@ -219,6 +219,14 @@ mod encode {
     }
 }
 
+/// The length of a decoded delete span; a delete of nothing is corrupt input.
+fn nonzero_delete_len(len: isize) -> LoroResult<isize> {
+    if len == 0 {
+        return Err(LoroError::DecodeDataCorruptionError);
+    }
+    Ok(len)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_op(
     cid: &ContainerID,
@@ -249,7 +257,7 @@ pub(crate) fn decode_op(
                     .ok_or(LoroError::DecodeDataCorruptionError)??;
                 let peer_idx = del_start.peer_idx;
                 let cnt = del_start.counter;
-                let len = del_start.len;
+                let len = nonzero_delete_len(del_start.len)?;
                 crate::op::InnerContent::List(crate::container::list::list_op::InnerListOp::Delete(
                     DeleteSpanWithId::new(
                         ID::new(
@@ -267,7 +275,9 @@ pub(crate) fn decode_op(
             Value::MarkStart(mark) => crate::op::InnerContent::List(
                 crate::container::list::list_op::InnerListOp::StyleStart {
                     start: prop as u32,
-                    end: prop as u32 + mark.len,
+                    end: (prop as u32)
+                        .checked_add(mark.len)
+                        .ok_or(LoroError::DecodeDataCorruptionError)?,
                     key: mark.key,
                     value: mark.value,
                     info: TextStyleInfoFlag::from_byte(mark.info),
@@ -318,7 +328,7 @@ pub(crate) fn decode_op(
                         .ok_or(LoroError::DecodeDataCorruptionError)??;
                     let peer_idx = del_start.peer_idx;
                     let cnt = del_start.counter;
-                    let len = del_start.len;
+                    let len = nonzero_delete_len(del_start.len)?;
                     crate::op::InnerContent::List(
                         crate::container::list::list_op::InnerListOp::Delete(
                             DeleteSpanWithId::new(
@@ -414,7 +424,7 @@ pub(crate) fn decode_op(
                         .ok_or(LoroError::DecodeDataCorruptionError)??;
                     let peer_idx = del_start.peer_idx;
                     let cnt = del_start.counter;
-                    let len = del_start.len;
+                    let len = nonzero_delete_len(del_start.len)?;
                     crate::op::InnerContent::List(
                         crate::container::list::list_op::InnerListOp::Delete(
                             DeleteSpanWithId::new(
@@ -512,6 +522,56 @@ mod test {
     };
 
     use super::*;
+
+    struct PeersOnly(Vec<loro_common::PeerID>);
+
+    impl ValueDecodedArenasTrait for PeersOnly {
+        fn keys(&self) -> &[loro_common::InternalString] {
+            &[]
+        }
+
+        fn peers(&self) -> &[loro_common::PeerID] {
+            &self.0
+        }
+
+        fn decode_tree_op(
+            &self,
+            _positions: &[Vec<u8>],
+            _op: crate::encoding::value::EncodedTreeMove,
+            _id: ID,
+        ) -> LoroResult<TreeOp> {
+            Err(LoroError::DecodeDataCorruptionError)
+        }
+    }
+
+    /// A delete of zero elements failed a debug assert; it is corrupt input
+    /// for text, list and movable list containers.
+    #[test]
+    fn an_empty_delete_is_a_decode_error() {
+        for container_type in [
+            ContainerType::Text,
+            ContainerType::List,
+            ContainerType::MovableList,
+        ] {
+            let cid = ContainerID::new_root("c", container_type);
+            let mut dels = std::iter::once(Ok(EncodedDeleteStartId {
+                peer_idx: 0,
+                counter: 0,
+                len: 0,
+            }));
+            let result = decode_op(
+                &cid,
+                Value::DeleteSeq,
+                &mut dels,
+                &SharedArena::new(),
+                &PeersOnly(vec![1]),
+                &[],
+                0,
+                ID::new(1, 0),
+            );
+            assert!(matches!(result, Err(LoroError::DecodeDataCorruptionError)));
+        }
+    }
 
     fn test_loro_value_read_write(v: impl Into<LoroValue>, container_id: Option<ContainerID>) {
         let v = v.into();
