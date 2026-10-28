@@ -526,11 +526,30 @@ impl TreeCacheForDiff {
         }
     }
 
+    /// Whether a node exists: it has an effective op.
+    fn node_exists(&self, id: TreeID) -> bool {
+        !matches!(self.get_parent_with_id(id).0, TreeParentId::Unexist)
+    }
+
     fn apply(&mut self, mut node: MoveLamportAndID) -> bool {
-        let mut effected = true;
-        if self.is_ancestor_of(&node.op.target(), &node.op.parent_id()) {
-            effected = false;
-        }
+        let target = node.op.target();
+        let parent = node.op.parent_id();
+        // An op is not effective if it would make a cycle, if it creates an
+        // existing node, moves or deletes a node that does not exist, or puts
+        // a node under a parent that does not exist. Honest peers never send
+        // the last three; ignoring them like cyclic moves keeps the tree
+        // acyclic and the result independent of the import order.
+        let target_exists = self.node_exists(target);
+        let target_ok = match &*node.op {
+            TreeOp::Create { .. } => !target_exists,
+            TreeOp::Move { .. } | TreeOp::Delete { .. } => target_exists,
+        };
+        let parent_ok = match parent {
+            TreeParentId::Node(p) => p != target && self.node_exists(p),
+            TreeParentId::Root | TreeParentId::Deleted => true,
+            TreeParentId::Unexist => false,
+        };
+        let effected = target_ok && parent_ok && !self.is_ancestor_of(&target, &parent);
         node.effected = effected;
         self.current_vv.set_last(node.id.id());
         self.tree.entry(node.op.target()).or_default().insert(node);
