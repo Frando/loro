@@ -691,6 +691,12 @@ pub fn decode_block(
             ID::new(peer, counter),
         )?;
 
+        // The encoded length advances the counter; it must agree with the
+        // decoded content, or the ops' counters would not match their ids.
+        if content.atom_len() != len as usize {
+            return Err(LoroError::DecodeDataCorruptionError);
+        }
+
         let c_idx = shared_arena.register_container(cid);
         let op = Op {
             counter,
@@ -714,6 +720,15 @@ pub fn decode_block(
             change_index += 1;
         }
     }
+
+    // Each change must hold exactly the ops of its counter range in the
+    // header, with contiguous non-empty ops.
+    for (change, end) in changes.iter().zip(header.counters.iter().skip(1)) {
+        encoding::check_decoded_change(change)?;
+        if change.ctr_end() != *end {
+            return Err(LoroError::DecodeDataCorruptionError);
+        }
+    }
     Ok(changes)
 }
 
@@ -725,7 +740,7 @@ mod test {
 
     use crate::encoding::value::{EncodedTreeMove, Value};
     use crate::{cursor::PosType, delta::DeltaValue, loro::ExportMode, LoroDoc};
-    use loro_common::LoroValue;
+    use loro_common::{IdSpan, LoroValue};
     use serde_columnar::{AnyRleEncoder, BoolRleEncoder, DeltaOfDeltaEncoder};
 
     use super::*;
@@ -958,6 +973,73 @@ mod test {
         let doc = two_map_changes();
         let update = crafted_update(&doc, |b| {
             b.header = Cow::Owned(header(&[1], &[false, true], &[0, 0], &[0], &[0, 0]));
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// A change claimed to sit at the top of the lamport range, so slicing
+    /// off the part the receiver holds overflowed the lamport.
+    #[test]
+    fn a_lamport_that_overflows_on_slicing_is_an_import_error() {
+        let doc = doc_with_changes(&["a", "b"], |doc, i| {
+            let text = doc.get_text("t");
+            let s = if i == 0 { "abc" } else { "d" };
+            text.insert(text.len_unicode(), s, PosType::Unicode)
+                .unwrap();
+        });
+        // The receiver holds the first atom of the first change.
+        let receiver = LoroDoc::new_auto_commit();
+        let first = doc
+            .export(ExportMode::updates_in_range(vec![IdSpan::new(PEER, 0, 1)]))
+            .unwrap();
+        receiver.import(&first).unwrap();
+        let update = crafted_update(&doc, |b| {
+            b.header = Cow::Owned(header(
+                &[3],
+                &[false, true],
+                &[0, 0],
+                &[u32::MAX as i64],
+                &[],
+            ));
+        });
+        assert_import_fails(&receiver, &update);
+    }
+
+    /// The encoded length of an op must equal its content's length; a map
+    /// op claimed 2 atoms or none. Such blocks used to import, with op
+    /// counters that disagree with the change's counter range.
+    #[test]
+    fn op_lengths_that_disagree_with_the_content_are_an_import_error() {
+        let doc = two_map_changes();
+        for len in [0, 2] {
+            let update = crafted_update(&doc, |b| {
+                let mut ops: EncodedOps = serde_columnar::from_bytes(&b.ops).unwrap();
+                ops.ops[0].len = len;
+                b.ops = Cow::Owned(serde_columnar::to_vec(&ops).unwrap());
+            });
+            assert_import_fails_on_new_doc(&update);
+        }
+    }
+
+    /// A block whose ops do not fill its changes leaves a change without
+    /// ops; it used to import as an empty change.
+    #[test]
+    fn a_change_without_ops_is_an_import_error() {
+        let doc = two_map_changes();
+        let update = crafted_update(&doc, |b| {
+            let mut ops: EncodedOps = serde_columnar::from_bytes(&b.ops).unwrap();
+            ops.ops.pop();
+            b.ops = Cow::Owned(serde_columnar::to_vec(&ops).unwrap());
+        });
+        assert_import_fails_on_new_doc(&update);
+    }
+
+    /// A counter past `i32::MAX` decodes as a negative counter.
+    #[test]
+    fn a_negative_counter_is_an_import_error() {
+        let doc = two_map_changes();
+        let update = crafted_update(&doc, |b| {
+            b.counter_start = u32::MAX;
         });
         assert_import_fails_on_new_doc(&update);
     }

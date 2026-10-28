@@ -328,9 +328,9 @@ impl OpLog {
     /// invalid external bytes or JSON must be an import error instead of a
     /// failed assertion deeper down:
     ///
-    /// - its counter is not negative, it has at least one op, its ops are
-    ///   contiguous from its counter on and not empty, and its counter range
-    ///   fits a [`Counter`];
+    /// - it passes `encoding::check_decoded_change`: its counter is not
+    ///   negative, it has at least one op, its ops are contiguous from its
+    ///   counter on and not empty, and its counter and lamport ranges fit;
     /// - its timestamp is within [`MAX_ABS_TIMESTAMP`] of 0, so that the
     ///   difference of two timestamps fits an `i64` when the change store
     ///   delta-encodes them;
@@ -357,31 +357,9 @@ impl OpLog {
                     format!("Invalid change {id}: {what}").into_boxed_str(),
                 ))
             };
-            if id.counter < 0 {
-                return bad("negative counter");
-            }
+            crate::encoding::check_decoded_change(change)?;
             if !(-MAX_ABS_TIMESTAMP..=MAX_ABS_TIMESTAMP).contains(&change.timestamp) {
                 return bad("timestamp out of range");
-            }
-            if change.ops.is_empty() {
-                return bad("no ops");
-            }
-            let mut end = id.counter;
-            for op in change.ops.iter() {
-                if op.counter != end {
-                    return bad("ops are not contiguous");
-                }
-                let len = op.atom_len();
-                if len == 0 {
-                    return bad("empty op");
-                }
-                let Some(op_end) = Counter::try_from(len)
-                    .ok()
-                    .and_then(|len| end.checked_add(len))
-                else {
-                    return bad("counter overflow");
-                };
-                end = op_end;
             }
             for dep in change.deps.iter() {
                 if dep.counter < 0 {
@@ -391,7 +369,7 @@ impl OpLog {
                     return bad("dep on an own op other than the previous one");
                 }
             }
-            atoms += (end - id.counter) as u64;
+            atoms += change.atom_len() as u64;
         }
 
         let held = self.dag.frontiers_to_next_lamport(self.dag.frontiers()) as u64;

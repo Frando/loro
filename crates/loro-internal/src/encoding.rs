@@ -15,8 +15,9 @@ use crate::change::Change;
 use crate::version::{Frontiers, VersionRange};
 use crate::LoroDoc;
 use crate::{oplog::OpLog, LoroError, VersionVector};
-use loro_common::{HasIdSpan, IdSpan, InternalString, LoroEncodeError, LoroResult, ID};
+use loro_common::{Counter, IdSpan, InternalString, Lamport, LoroEncodeError, LoroResult, ID};
 use num_traits::{FromPrimitive, ToPrimitive};
+use rle::HasLength;
 use std::borrow::Cow;
 
 /// The mode of the export.
@@ -257,6 +258,52 @@ pub(crate) fn decode_oplog_changes(
         EncodeMode::FastUpdates => fast_snapshot::decode_updates(oplog, body.to_vec().into()),
         EncodeMode::Auto => unreachable!(),
     }
+}
+
+/// Checks the structure of a change decoded from external bytes, before
+/// anything slices, merges or applies it.
+///
+/// The counter must be non-negative, the change must have at least one op,
+/// every op must be non-empty and start where the previous one ends (the
+/// first at the change's counter), the counter range must fit a `Counter`,
+/// and the lamport range must fit a `Lamport`. `Change::slice`,
+/// `Change::atom_len` and the oplog rely on these properties; an encoder
+/// never produces a change that breaks them.
+pub(crate) fn check_decoded_change(change: &Change) -> LoroResult<()> {
+    let bad = |what: &str| {
+        Err(LoroError::DecodeError(
+            format!("invalid change {}: {what}", change.id).into_boxed_str(),
+        ))
+    };
+    if change.id.counter < 0 {
+        return bad("negative counter");
+    }
+    if change.ops.is_empty() {
+        return bad("no ops");
+    }
+    let mut end = change.id.counter;
+    for op in change.ops.iter() {
+        if op.counter != end {
+            return bad("op counters are not contiguous");
+        }
+        let len = op.atom_len();
+        if len == 0 {
+            return bad("empty op");
+        }
+        let Some(op_end) = Counter::try_from(len)
+            .ok()
+            .and_then(|len| end.checked_add(len))
+        else {
+            return bad("counter overflow");
+        };
+        end = op_end;
+    }
+    // `end > change.id.counter >= 0`, so the length is positive and fits.
+    let len = (end - change.id.counter) as Lamport;
+    if change.lamport.checked_add(len).is_none() {
+        return bad("lamport overflow");
+    }
+    Ok(())
 }
 
 pub(crate) struct ApplyDecodedChangesResult {
