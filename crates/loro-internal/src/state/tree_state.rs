@@ -735,6 +735,30 @@ impl TreeState {
         Ok(())
     }
 
+    /// Whether an op-derived diff item (in the `Linear` and
+    /// `ImportGreaterUpdates` modes) is effective, by the rules of the tree
+    /// diff calculator (`TreeCacheForDiff::apply`): a create of a new node or
+    /// a move or delete of an existing node, under an existing parent,
+    /// without a cycle.
+    fn is_effective_op(&self, target: TreeID, action: &TreeInternalDiff) -> bool {
+        let (parent, is_create) = match action {
+            TreeInternalDiff::Create { parent, .. } => (*parent, true),
+            TreeInternalDiff::Move { parent, .. } => (*parent, false),
+            TreeInternalDiff::Delete { .. } => (TreeParentId::Deleted, false),
+            TreeInternalDiff::MoveInDelete { .. } | TreeInternalDiff::UnCreate => return true,
+        };
+        if is_create == self.trees.contains_key(&target) {
+            return false;
+        }
+        match parent {
+            TreeParentId::Node(p) => {
+                p != target && self.trees.contains_key(&p) && !self.is_ancestor_of(&target, &parent)
+            }
+            TreeParentId::Root | TreeParentId::Deleted => true,
+            TreeParentId::Unexist => false,
+        }
+    }
+
     #[inline(never)]
     fn is_ancestor_of(&self, maybe_ancestor: &TreeID, node_id: &TreeParentId) -> bool {
         if !self.trees.contains_key(maybe_ancestor) {
@@ -1059,12 +1083,16 @@ impl ContainerState for TreeState {
         ctx: DiffApplyContext,
     ) -> Diff {
         let need_check = !matches!(ctx.mode, DiffMode::Checkout | DiffMode::Linear);
+        let from_ops = !matches!(ctx.mode, DiffMode::Checkout);
         let mut ans = vec![];
         if let InternalDiff::Tree(tree) = &diff {
             // assert never cause cycle move
             for diff in tree.diff.iter() {
                 let last_move_op = diff.last_effective_move_op_id;
                 let target = diff.target;
+                if from_ops && !self.is_effective_op(target, &diff.action) {
+                    continue;
+                }
                 // create associated metadata container
                 match &diff.action {
                     TreeInternalDiff::Create { parent, position } => {
@@ -1229,10 +1257,14 @@ impl ContainerState for TreeState {
     fn apply_diff(&mut self, diff: InternalDiff, ctx: DiffApplyContext) -> LoroResult<()> {
         if let InternalDiff::Tree(tree) = &diff {
             let need_check = !matches!(ctx.mode, DiffMode::Checkout | DiffMode::Linear);
+            let from_ops = !matches!(ctx.mode, DiffMode::Checkout);
             // assert never cause cycle move
             for diff in tree.diff.iter() {
                 let last_move_op = diff.last_effective_move_op_id;
                 let target = diff.target;
+                if from_ops && !self.is_effective_op(target, &diff.action) {
+                    continue;
+                }
                 // create associated metadata container
                 match &diff.action {
                     TreeInternalDiff::Create { parent, position }
