@@ -309,19 +309,27 @@ impl ChangeStore {
     ) -> Result<Vec<Change>, LoroError> {
         let change_store = ChangeStore::new_mem(arena, Arc::new(AtomicI64::new(0)));
         let _ = change_store.import_all(bytes)?;
+        // Every change block is parsed here, and a block that does not parse
+        // fails the import instead of being skipped: skipping it would import
+        // the other blocks without the changes they may depend on.
+        let blocks: Vec<Bytes> = change_store
+            .external_kv
+            .lock()
+            .scan(Bound::Unbounded, Bound::Unbounded)
+            .filter(|(id, _)| id.len() == 12)
+            .map(|(_, bytes)| bytes)
+            .collect();
         let mut changes = Vec::new();
-        change_store.visit_all_changes(&mut |c| {
-            let cnt_threshold = self_vv.get(&c.id.peer).copied().unwrap_or(0);
-            if c.id.counter >= cnt_threshold {
-                changes.push(c.clone());
-                return;
+        for bytes in blocks {
+            for c in ChangesBlockBytes::new(bytes).parse(arena)? {
+                let cnt_threshold = self_vv.get(&c.id.peer).copied().unwrap_or(0);
+                if c.id.counter >= cnt_threshold {
+                    changes.push(c);
+                } else if c.ctr_end() > cnt_threshold {
+                    changes.push(c.slice((cnt_threshold - c.id.counter) as usize, c.atom_len()));
+                }
             }
-
-            let change_end = c.ctr_end();
-            if change_end > cnt_threshold {
-                changes.push(c.slice((cnt_threshold - c.id.counter) as usize, c.atom_len()));
-            }
-        });
+        }
 
         Ok(changes)
     }
