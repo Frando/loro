@@ -899,43 +899,40 @@ impl MovableListHistoryCache {
             })
             .map_or_else(
                 || {
-                    let id = oplog.idlp_to_id(key).unwrap();
+                    // A crafted remote op can name an element that was never
+                    // inserted, or an op that is not an insert: no value.
+                    let id = oplog.idlp_to_id(key)?;
                     if vv.get(&id.peer).copied().unwrap_or(0) <= id.counter {
                         return None;
                     }
-                    let op = oplog.get_op_that_includes(id).unwrap();
+                    let op = oplog.get_op_that_includes(id)?;
                     let offset = id.counter - op.counter;
                     match &op.content {
                         InnerContent::List(InnerListOp::Insert { slice, .. }) => {
                             let value = oplog
                                 .arena
-                                .get_value(slice.0.start as usize + offset as usize)
-                                .unwrap();
+                                .get_value(slice.0.start as usize + offset as usize)?;
                             Some(GroupedMapOpInfo {
                                 value,
                                 lamport: key.lamport,
                                 peer: id.peer,
                             })
                         }
-                        _ => {
-                            unreachable!()
-                        }
+                        _ => None,
                     }
                 },
                 |e| {
                     let (lamport, value) = match &e.counter_or_value {
                         Either::Left(c) => {
                             let id = ID::new(e.peer, *c);
-                            let op = oplog.get_op_that_includes(id).unwrap();
+                            let op = oplog.get_op_that_includes(id)?;
                             debug_assert_eq!(op.atom_len(), 1);
                             let lamport = op.lamport();
                             match &op.content {
                                 InnerContent::List(InnerListOp::Set { value, .. }) => {
                                     (lamport, value.clone())
                                 }
-                                _ => {
-                                    unreachable!()
-                                }
+                                _ => return None,
                             }
                         }
                         Either::Right(v) => (e.lamport, v.as_ref().clone()),
@@ -977,7 +974,7 @@ impl MovableListHistoryCache {
             .find(|e| vv.get(&e.peer).copied().unwrap_or(0) > e.counter)
             .map_or_else(
                 || {
-                    let id = oplog.idlp_to_id(key).unwrap();
+                    let id = oplog.idlp_to_id(key)?;
                     if vv.get(&id.peer).copied().unwrap_or(0) > id.counter {
                         Some(IdFull::new(id.peer, id.counter, key.lamport))
                     } else {

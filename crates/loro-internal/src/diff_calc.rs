@@ -2118,9 +2118,13 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
                         return false;
                     };
                     // TODO: PERF: Provide the lamport of to version
-                    let value = checkout_index
-                        .last_value(id, info.to_vv, Lamport::MAX, oplog)
-                        .unwrap();
+                    // None only for an element that a crafted op names but
+                    // that was never inserted: the op has no effect.
+                    let Some(value) =
+                        checkout_index.last_value(id, info.to_vv, Lamport::MAX, oplog)
+                    else {
+                        return false;
+                    };
                     // TODO: PERF: Provide the lamport of to version
                     let old_pos = checkout_index.last_pos(id, info.from_vv, Lamport::MAX, oplog);
                     // TODO: PERF: Provide the lamport of to version
@@ -2189,12 +2193,21 @@ impl MovableListDiffCalculator {
                     move_id_to_elem_id.insert(op.id(), *elem_id);
                     if !tracker.current_vv().includes_id(op.id()) {
                         let last_pos = if is_checkout {
-                            oplog.with_history_cache(|h| {
-                                let list = &h.get_checkout_index().movable_list;
-                                list.last_pos(*elem_id, tracker.current_vv(), Lamport::MAX, oplog)
-                                    .expect("moved element should have a visible source position")
-                                    .id()
-                            })
+                            oplog
+                                .with_history_cache(|h| {
+                                    let list = &h.get_checkout_index().movable_list;
+                                    list.last_pos(
+                                        *elem_id,
+                                        tracker.current_vv(),
+                                        Lamport::MAX,
+                                        oplog,
+                                    )
+                                })
+                                .map(|pos| pos.id())
+                                // A crafted move of an element that was never
+                                // inserted has no visible source position;
+                                // record it like the import modes do.
+                                .unwrap_or(ID::new(PeerID::MAX - 2, 0))
                         } else {
                             // In import/linear mode this id is only needed if the tracker is later
                             // checked out before the source version, which those modes do not do.

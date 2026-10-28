@@ -5,7 +5,9 @@ use std::sync::Weak;
 use tracing::{instrument, warn};
 
 use generic_btree::BTree;
-use loro_common::{CompactIdLp, ContainerID, IdFull, IdLp, LoroResult, LoroValue, PeerID, ID};
+use loro_common::{
+    CompactIdLp, ContainerID, IdFull, IdLp, LoroError, LoroResult, LoroValue, PeerID, ID,
+};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -1275,6 +1277,45 @@ impl ContainerState for MovableListState {
         // }
 
         Diff::List(event)
+    }
+
+    /// Checks that the list part of the diff retains and deletes no more
+    /// list items than the state holds, and that every element the state
+    /// does not hold yet comes with a position and a value. Diffs computed
+    /// from crafted remote ops (an insert past the end, a move or set of an
+    /// element that was never created) break both, which the state asserts
+    /// against.
+    fn validate_diff(&self, diff: &InternalDiff) -> LoroResult<()> {
+        let InternalDiff::MovableList(diff) = diff else {
+            return Err(LoroError::internal(
+                "movable list state got a non-movable-list diff",
+            ));
+        };
+        let len = self.inner.len_kind(IndexType::ForOp);
+        let mut consumed = 0usize;
+        for item in diff.list.iter() {
+            let n = match item {
+                DeltaItem::Retain { retain, .. } => *retain,
+                DeltaItem::Delete { delete, .. } => *delete,
+                DeltaItem::Insert { .. } => 0,
+            };
+            consumed = consumed.saturating_add(n);
+        }
+        if consumed > len {
+            return Err(LoroError::internal(format!(
+                "movable list diff covers {consumed} list items but the state only has {len}",
+            )));
+        }
+        for (elem_id, elem) in diff.elements.iter() {
+            if !self.inner.elements().contains_key(elem_id)
+                && (elem.pos.is_none() || elem.value_id.is_none())
+            {
+                return Err(LoroError::internal(
+                    "movable list diff updates an element that does not exist",
+                ));
+            }
+        }
+        Ok(())
     }
 
     // How we apply the diff is coupled with the [DiffMode] we used to calculate the diff.

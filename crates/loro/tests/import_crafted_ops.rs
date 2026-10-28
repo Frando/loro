@@ -379,3 +379,35 @@ fn richtext_state_delete_past_the_end() {
 fn richtext_state_mark_past_the_end() {
     assert_attached_import_fails(&[(T, mark(0, 1000)), (T, json!({"type":"mark_end"}))]);
 }
+
+#[test]
+fn movable_list_state_insert_past_the_end() {
+    assert_attached_import_fails(&[(
+        "cid:root-ml:MovableList",
+        json!({"type":"insert","pos":100,"value":[1]}),
+    )]);
+}
+
+#[test]
+fn movable_list_move_of_an_unknown_element() {
+    assert_attached_import_fails(&[(
+        "cid:root-ml:MovableList",
+        json!({"type":"move","from":0,"to":1,"elem_id":"L99@0"}),
+    )]);
+}
+
+#[test]
+fn movable_list_set_of_an_unknown_element() {
+    assert_attached_import_fails(&[(
+        "cid:root-ml:MovableList",
+        json!({"type":"set","elem_id":"L99@0","value":5}),
+    )]);
+}
+
+#[test]
+fn movable_list_move_of_a_text_op() {
+    assert_attached_import_fails(&[(
+        "cid:root-ml:MovableList",
+        json!({"type":"move","from":0,"to":1,"elem_id":"L0@0"}),
+    )]);
+}
