@@ -114,16 +114,6 @@ impl InternalStringData {
     }
 }
 
-impl Drop for InternalStringData {
-    fn drop(&mut self) {
-        if let InternalStringData::Dynamic(arc) = self {
-            if Arc::strong_count(arc) == 2 {
-                drop_cache(arc.clone());
-            }
-        }
-    }
-}
-
 impl AsRef<str> for InternalString {
     fn as_ref(&self) -> &str {
         self.as_str()
@@ -217,37 +207,42 @@ impl Borrow<str> for ArcWrapper {
 static STRING_SET: LazyLock<Mutex<FxHashSet<ArcWrapper>>> =
     LazyLock::new(|| Mutex::new(FxHashSet::default()));
 
-fn get_or_init_internalized_string(s: &str) -> Arc<Box<str>> {
-    static MAX_MET_CACHE_SIZE: AtomicUsize = AtomicUsize::new(1 << 16);
+/// The fewest strings the interning set holds before it evicts.
+const MIN_INTERNED_LIMIT: usize = 1 << 12;
 
+/// The size at which the interning set evicts strings no one holds.
+static INTERNED_LIMIT: AtomicUsize = AtomicUsize::new(MIN_INTERNED_LIMIT);
+
+/// Interns `s`.
+///
+/// Strings no one holds any more stay in the set until it reaches its
+/// limit; then they are evicted at once and the limit becomes twice the
+/// strings still held (at least [`MIN_INTERNED_LIMIT`]). So a string used
+/// and dropped over and over (a key of many small documents) is
+/// allocated and hashed in once, and the set holds at most twice the live
+/// strings plus [`MIN_INTERNED_LIMIT`].
+fn get_or_init_internalized_string(s: &str) -> Arc<Box<str>> {
     let mut set = STRING_SET.lock().unwrap();
     if let Some(v) = set.get(s) {
-        v.0.clone()
-    } else {
-        let ans: Arc<Box<str>> = Arc::new(Box::from(s));
-        set.insert(ArcWrapper(ans.clone()));
-        let max = MAX_MET_CACHE_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-        if set.capacity() >= max {
-            let old = set.len();
-            set.retain(|s| Arc::strong_count(&s.0) > 1);
-            let new = set.len();
-            if old - new > new / 2 {
-                set.shrink_to_fit();
-            }
+        return v.0.clone();
+    }
 
-            MAX_MET_CACHE_SIZE.store(max * 2, std::sync::atomic::Ordering::Relaxed);
+    let limit = INTERNED_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+    if set.len() >= limit {
+        set.retain(|s| Arc::strong_count(&s.0) > 1);
+        let live = set.len();
+        INTERNED_LIMIT.store(
+            (live * 2).max(MIN_INTERNED_LIMIT),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if set.capacity() > 4 * live.max(MIN_INTERNED_LIMIT) {
+            set.shrink_to_fit();
         }
-
-        ans
     }
-}
 
-fn drop_cache(s: Arc<Box<str>>) {
-    let mut set = STRING_SET.lock().unwrap();
-    set.remove(&ArcWrapper(s));
-    if set.len() < set.capacity() / 2 && set.capacity() > 128 {
-        set.shrink_to_fit();
-    }
+    let ans: Arc<Box<str>> = Arc::new(Box::from(s));
+    set.insert(ArcWrapper(ans.clone()));
+    ans
 }
 
 #[cfg(test)]
@@ -299,17 +294,24 @@ mod tests {
     }
 
     #[test]
-    fn test_long_string_cache_drop() {
-        {
-            let set = STRING_SET.lock().unwrap();
-            assert_eq!(set.len(), 0);
+    fn dropped_strings_are_evicted_at_the_limit() {
+        let held = InternalString::from("held: a string that stays alive");
+        // Strings made and dropped at once stay in the set until it fills.
+        for i in 0..(3 * MIN_INTERNED_LIMIT) {
+            let s = InternalString::from(format!("dropped string number {i}").as_str());
+            assert!(s.len() > 7);
+            let len = STRING_SET.lock().unwrap().len();
+            let limit = INTERNED_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(len <= limit + 1, "{len} > {limit} + 1");
         }
-        {
-            let s1 = InternalString::from("hello".repeat(10));
-            let s2 = InternalString::from("hello".repeat(10));
-            assert!(std::ptr::eq(s1.as_str().as_ptr(), s2.as_str().as_ptr()));
-        }
-        let set = STRING_SET.lock().unwrap();
-        assert_eq!(set.len(), 0);
+        // The held string survives every eviction and is still shared.
+        let again = InternalString::from("held: a string that stays alive");
+        assert!(std::ptr::eq(
+            held.as_str().as_ptr(),
+            again.as_str().as_ptr()
+        ));
+        // A dropped string interned again is equal, wherever it lives.
+        let a = InternalString::from("dropped string number 0");
+        assert_eq!(a.as_str(), "dropped string number 0");
     }
 }
