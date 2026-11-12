@@ -8,7 +8,7 @@
 //! `context/import-peer-id-reuse.md`.
 
 use loro_common::{
-    Counter, HasCounterSpan, HasIdSpan, LoroError, LoroResult, LoroValue, PeerID, ID,
+    Counter, HasCounterSpan, HasIdSpan, Lamport, LoroError, LoroResult, LoroValue, PeerID, ID,
 };
 use rle::{HasLength, Sliceable};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -157,6 +157,9 @@ impl OpLog {
             }
             if change.ctr_end() > known_end {
                 self.check_parked_part_of_change(change, known_end, values, imported_arena)?;
+                if change.id.counter < known_end {
+                    Self::check_slice_lamport(change, known_end)?;
+                }
             }
         }
         self.check_changes_agree_with_each_other(&changes, values, imported_arena)?;
@@ -177,6 +180,24 @@ impl OpLog {
         self.check_changes_do_not_skip_counters(&changes)?;
         self.check_changes_include_predecessors(&changes)?;
         Ok(changes)
+    }
+
+    /// Slicing off the known atoms of `change`, up to `known_end`, adds their count to
+    /// its lamport, which must fit a [`Lamport`]. A crafted change at the top of the
+    /// lamport range overflowed there: a panic in debug builds under the document's
+    /// locks, a wrapped lamport in release.
+    fn check_slice_lamport(change: &Change, known_end: Counter) -> LoroResult<()> {
+        let fits = Lamport::try_from(known_end - change.id.counter)
+            .ok()
+            .and_then(|offset| change.lamport.checked_add(offset))
+            .is_some();
+        if fits {
+            Ok(())
+        } else {
+            Err(LoroError::DecodeError(
+                format!("Invalid change {}: lamport overflow", change.id).into_boxed_str(),
+            ))
+        }
     }
 
     /// The timestamp of every change is within [`MAX_ABS_TIMESTAMP`] of 0, so

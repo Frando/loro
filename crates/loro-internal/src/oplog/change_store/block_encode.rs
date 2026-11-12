@@ -811,6 +811,152 @@ mod test {
 
     use super::*;
 
+    use loro_common::{IdSpan, LoroValue};
+    use serde_columnar::{AnyRleEncoder, BoolRleEncoder, DeltaOfDeltaEncoder};
+
+    // Crafted blocks that used to panic during decode. Each is wrapped in a
+    // fast-update blob and imported; the import must fail and leave the
+    // document usable.
+
+    const PEER: PeerID = 7;
+
+    /// A document of `PEER` with one change per entry of `msgs`; each change
+    /// is made by `edit` and carries its own commit message, so changes do
+    /// not merge.
+    fn doc_with_changes(msgs: &[&str], edit: impl Fn(&LoroDoc, usize)) -> LoroDoc {
+        let doc = LoroDoc::new_auto_commit();
+        doc.set_peer_id(PEER).unwrap();
+        for (i, msg) in msgs.iter().enumerate() {
+            doc.set_next_commit_message(msg);
+            edit(&doc, i);
+            doc.commit_then_renew();
+        }
+        doc
+    }
+
+    /// The only block of `doc`'s full update.
+    fn only_block(doc: &LoroDoc) -> Vec<u8> {
+        let bytes = doc.export(ExportMode::all_updates()).unwrap();
+        let mut body = &bytes[22..];
+        let len = leb128::read::unsigned(&mut body).unwrap() as usize;
+        assert_eq!(body.len(), len, "the update has one block");
+        body.to_vec()
+    }
+
+    /// A fast-update blob that holds `block`.
+    fn update_with_block(block: &[u8]) -> Vec<u8> {
+        let mut ans = b"loro".to_vec();
+        ans.extend([0; 16]);
+        ans.extend(crate::encoding::EncodeMode::FastUpdates.to_bytes());
+        leb128::write::unsigned(&mut ans, block.len() as u64).unwrap();
+        ans.extend_from_slice(block);
+        let checksum = xxhash_rust::xxh32::xxh32(&ans[20..], u32::from_le_bytes(*b"LORO"));
+        ans[16..20].copy_from_slice(&checksum.to_le_bytes());
+        ans
+    }
+
+    /// `doc`'s block rewritten by `f`, as a fast-update blob.
+    fn crafted_update(doc: &LoroDoc, f: impl FnOnce(&mut EncodedBlock)) -> Vec<u8> {
+        let block = only_block(doc);
+        let mut encoded: EncodedBlock = postcard::from_bytes(&block).unwrap();
+        f(&mut encoded);
+        update_with_block(&postcard::to_allocvec(&encoded).unwrap())
+    }
+
+    /// Imports `update` into `doc`, which must fail, and checks that the
+    /// document still takes local edits.
+    fn assert_import_fails(doc: &LoroDoc, update: &[u8]) {
+        assert!(doc.import(update).is_err());
+        doc.get_map("after").insert("still", "usable").unwrap();
+        doc.commit_then_renew();
+        assert_eq!(
+            doc.get_map("after").get("still"),
+            Some(LoroValue::from("usable"))
+        );
+    }
+
+    fn two_map_changes() -> LoroDoc {
+        doc_with_changes(&["a", "b"], |doc, i| {
+            doc.get_map("m").insert(&i.to_string(), i as i64).unwrap();
+        })
+    }
+
+    /// Builds a block header the way `encode_changes` does, from its parts.
+    fn header(
+        lengths: &[u64],
+        dep_self: &[bool],
+        deps_len: &[usize],
+        lamports: &[i64],
+        trailing: &[u8],
+    ) -> Vec<u8> {
+        let mut ans = Vec::new();
+        leb128::write::unsigned(&mut ans, 1).unwrap();
+        ans.extend(PEER.to_le_bytes());
+        for len in lengths {
+            leb128::write::unsigned(&mut ans, *len).unwrap();
+        }
+        let mut dep_self_encoder = BoolRleEncoder::new();
+        for b in dep_self {
+            dep_self_encoder.append(*b).unwrap();
+        }
+        ans.extend(dep_self_encoder.finish().unwrap());
+        let mut deps_len_encoder = AnyRleEncoder::<usize>::new();
+        for l in deps_len {
+            deps_len_encoder.append(*l).unwrap();
+        }
+        ans.extend(deps_len_encoder.finish().unwrap());
+        ans.extend(AnyRleEncoder::<u32>::new().finish().unwrap());
+        ans.extend(DeltaOfDeltaEncoder::new().finish().unwrap());
+        let mut lamport_encoder = DeltaOfDeltaEncoder::new();
+        for l in lamports {
+            lamport_encoder.append(*l).unwrap();
+        }
+        ans.extend(lamport_encoder.finish().unwrap());
+        ans.extend_from_slice(trailing);
+        ans
+    }
+
+    /// The honest header of `two_map_changes` decodes like the original, so
+    /// the crafted headers below differ only in what each test changes.
+    #[test]
+    fn crafted_header_matches_the_encoder() {
+        let doc = two_map_changes();
+        let block = only_block(&doc);
+        let encoded: EncodedBlock = postcard::from_bytes(&block).unwrap();
+        assert_eq!(
+            encoded.header.as_ref(),
+            header(&[1], &[false, true], &[0, 0], &[0], &[]).as_slice()
+        );
+    }
+
+    /// A change claimed to sit at the top of the lamport range, so slicing
+    /// off the part the receiver holds overflowed the lamport.
+    #[test]
+    fn a_lamport_that_overflows_on_slicing_is_an_import_error() {
+        let doc = doc_with_changes(&["a", "b"], |doc, i| {
+            let text = doc.get_text("t");
+            let s = if i == 0 { "abc" } else { "d" };
+            text.insert(text.len_unicode(), s, PosType::Unicode)
+                .unwrap();
+        });
+        // The receiver holds the first atom of the first change.
+        let receiver = LoroDoc::new_auto_commit();
+        let first = doc
+            .export(ExportMode::updates_in_range(vec![IdSpan::new(PEER, 0, 1)]))
+            .unwrap();
+        receiver.import(&first).unwrap();
+        let update = crafted_update(&doc, |b| {
+            b.header = Cow::Owned(header(
+                &[3],
+                &[false, true],
+                &[0, 0],
+                &[u32::MAX as i64],
+                &[],
+            ));
+        });
+        assert_import_fails(&receiver, &update);
+    }
+
     #[test]
     fn cached_header_does_not_trust_modified_metadata_count() {
         let source = LoroDoc::new_auto_commit();
