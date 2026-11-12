@@ -176,6 +176,7 @@ impl OpLog {
             }
         });
         Self::check_timestamps(&changes)?;
+        self.check_lamports_fit(&changes)?;
         Self::check_own_peer_deps(&changes)?;
         self.check_changes_do_not_skip_counters(&changes)?;
         self.check_changes_include_predecessors(&changes)?;
@@ -198,6 +199,24 @@ impl OpLog {
                 format!("Invalid change {}: lamport overflow", change.id).into_boxed_str(),
             ))
         }
+    }
+
+    /// The lamports that the changes can get fit a [`Lamport`]. A change's lamport
+    /// is one more than its largest dep's, so after this import no lamport exceeds
+    /// the largest lamport held plus every imported and parked atom. Chained
+    /// crafted changes of up to 2^30 atoms each (a delete) got lamports past
+    /// `u32::MAX`, which overflowed the lamport arithmetic of the DAG.
+    fn check_lamports_fit(&self, changes: &[Change]) -> LoroResult<()> {
+        let held = self.dag.frontiers_to_next_lamport(self.dag.frontiers()) as u64;
+        let imported: u64 = changes.iter().map(|c| c.atom_len() as u64).sum();
+        if held + imported + self.pending_changes.atom_count() > Lamport::MAX as u64 {
+            return Err(LoroError::DecodeError(
+                "Invalid changes: their lamports would overflow"
+                    .to_string()
+                    .into_boxed_str(),
+            ));
+        }
+        Ok(())
     }
 
     /// The timestamp of every change is within [`MAX_ABS_TIMESTAMP`] of 0, so

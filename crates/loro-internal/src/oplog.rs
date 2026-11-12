@@ -219,14 +219,20 @@ impl OpLog {
 
     #[inline]
     fn calc_visible_op_count(&self) -> usize {
-        let total = self.dag.vv().values().sum::<i32>() as usize;
+        // Summed as `usize`: the counters of many peers can exceed `i32`.
+        let total = self
+            .dag
+            .vv()
+            .values()
+            .map(|&ops| ops.max(0) as usize)
+            .sum::<usize>();
         let shallow = self
             .dag
             .shallow_since_vv()
             .iter()
-            .map(|(_, ops)| *ops)
-            .sum::<i32>() as usize;
-        total - shallow
+            .map(|(_, &ops)| ops.max(0) as usize)
+            .sum::<usize>();
+        total.saturating_sub(shallow)
     }
 
     #[inline]

@@ -338,6 +338,16 @@ impl PendingChanges {
 
         range
     }
+
+    /// The number of atoms of all parked changes, counting overlaps twice.
+    pub(crate) fn atom_count(&self) -> u64 {
+        self.changes
+            .values()
+            .flat_map(|tree| tree.values())
+            .flatten()
+            .map(|change| change.atom_len() as u64)
+            .sum()
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,11 @@
 //! import are import errors before anything is mutated, and honest edge
 //! cases import.
 
-use loro::{CommitOptions, ExportMode, JsonSchema, LoroDoc, VersionVector, ID};
+use loro::{
+    json::{JsonOp, JsonOpContent, ListOp},
+    CommitOptions, ContainerID, ContainerType, ExportMode, JsonChange, JsonSchema, LoroDoc,
+    VersionVector, ID,
+};
 
 /// Alice's three changes (counters 0, 1, 2), one map key each, and a
 /// change of Bob that depends on her second (so her node at counter 1 has
@@ -128,4 +132,83 @@ fn a_change_with_more_deps_than_fit_a_block_imports() {
         assert_eq!(y.get_deep_value(), base.get_deep_value());
         assert_eq!(y.oplog_vv(), base.oplog_vv());
     }
+}
+
+/// The longest delete that passes the position checks: 2^30 - 2 atoms.
+const LONG: i32 = (u32::MAX / 4 - 2) as i32;
+
+/// A change of `peer` at counter 0 that deletes `LONG` list elements, with
+/// a dep on the last atom of `dep_peer`'s change.
+fn long_delete(peer: u64, dep_peer: Option<u64>) -> JsonChange {
+    JsonChange {
+        id: ID::new(peer, 0),
+        timestamp: 0,
+        deps: dep_peer.map(|p| ID::new(p, LONG - 1)).into_iter().collect(),
+        lamport: 0,
+        msg: None,
+        ops: vec![JsonOp {
+            content: JsonOpContent::List(ListOp::Delete {
+                pos: 0,
+                len: LONG,
+                start_id: ID::new(peer, 0),
+            }),
+            container: ContainerID::new_root("l", ContainerType::List),
+            counter: 0,
+        }],
+    }
+}
+
+fn schema(changes: Vec<JsonChange>) -> JsonSchema {
+    JsonSchema {
+        schema_version: 1,
+        start_version: Default::default(),
+        peers: None,
+        changes,
+    }
+}
+
+/// Peers 1 to `n`, each change depending on the one before.
+fn long_chain(n: u64) -> Vec<JsonChange> {
+    (1..=n)
+        .map(|p| long_delete(p, (p > 1).then(|| p - 1)))
+        .collect()
+}
+
+/// Five chained changes of 2^30 - 2 atoms each would get lamports past
+/// `u32::MAX`, which overflowed the lamport arithmetic of the DAG; three of
+/// them overflowed the visible op count, summed as `i32`. Five are an
+/// import error, also when they arrive in separate imports; three import.
+#[test]
+fn lamports_past_u32_are_an_import_error() {
+    for detached in [true, false] {
+        assert!(import_fails(schema(long_chain(5)), detached));
+    }
+    // The deletes target elements that do not exist, so the oplog is
+    // checked without computing a state.
+    let y = LoroDoc::new();
+    y.detach();
+    let mut chain = long_chain(5);
+    let last = chain.pop().unwrap();
+    y.import_json_updates(schema(chain)).unwrap();
+    let vv = y.oplog_vv();
+    assert!(y.import_json_updates(schema(vec![last])).is_err());
+    assert_eq!(y.oplog_vv(), vv);
+    assert_eq!(y.len_ops(), 4 * LONG as usize);
+}
+
+/// Parked changes count too: the change that would overflow arrives
+/// first and waits, then its deps arrive.
+#[test]
+fn parked_changes_count_toward_the_lamport_limit() {
+    let y = LoroDoc::new();
+    y.detach();
+    let mut chain = long_chain(5);
+    let last = chain.pop().unwrap();
+    let status = y.import_json_updates(schema(vec![last])).unwrap();
+    assert!(status.pending.is_some());
+    let fourth = chain.pop().unwrap();
+    y.import_json_updates(schema(chain)).unwrap();
+    assert!(y.import_json_updates(schema(vec![fourth])).is_err());
+    assert_eq!(y.oplog_vv().get(&4), None);
+    assert_eq!(y.oplog_vv().get(&5), None);
 }
