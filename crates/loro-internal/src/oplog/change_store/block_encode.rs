@@ -875,6 +875,11 @@ mod test {
         );
     }
 
+    fn assert_import_fails_on_new_doc(update: &[u8]) {
+        let doc = LoroDoc::new_auto_commit();
+        assert_import_fails(&doc, update);
+    }
+
     fn two_map_changes() -> LoroDoc {
         doc_with_changes(&["a", "b"], |doc, i| {
             doc.get_map("m").insert(&i.to_string(), i as i64).unwrap();
@@ -927,6 +932,28 @@ mod test {
             encoded.header.as_ref(),
             header(&[1], &[false, true], &[0, 0], &[0], &[]).as_slice()
         );
+    }
+
+    /// A mark whose end overflowed `u32` panicked in debug builds.
+    #[test]
+    fn a_mark_end_that_overflows_is_an_import_error() {
+        let doc = doc_with_changes(&["a"], |doc, _| {
+            let text = doc.get_text("t");
+            text.insert(0, "ab", PosType::Unicode).unwrap();
+            text.mark(0, 2, "bold", true.into(), PosType::Unicode)
+                .unwrap();
+        });
+        let update = crafted_update(&doc, |b| {
+            let mut ops: EncodedOps = serde_columnar::from_bytes(&b.ops).unwrap();
+            let mark = ops
+                .ops
+                .iter_mut()
+                .find(|op| matches!(ValueKind::from_u8(op.value_type), ValueKind::MarkStart))
+                .unwrap();
+            mark.prop = -1;
+            b.ops = Cow::Owned(serde_columnar::to_vec(&ops).unwrap());
+        });
+        assert_import_fails_on_new_doc(&update);
     }
 
     /// A change claimed to sit at the top of the lamport range, so slicing
