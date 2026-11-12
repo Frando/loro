@@ -392,6 +392,26 @@ pub fn decode_header(m_bytes: &[u8]) -> LoroResult<ChangesBlockHeader> {
     decode_header_from_doc(&doc)
 }
 
+/// The header of a block and the timestamp of each of its changes,
+/// without decoding its ops.
+pub(crate) fn decode_header_and_timestamps(
+    m_bytes: &[u8],
+) -> LoroResult<(ChangesBlockHeader, Vec<i64>)> {
+    let doc: EncodedBlock = postcard::from_bytes(m_bytes)
+        .map_err(|e| LoroError::DecodeError(format!("Decode block error {e}").into_boxed_str()))?;
+    let header = decode_header_from_doc(&doc)?;
+    let n_changes = doc.n_changes as usize;
+    check_delta_of_delta(&doc.change_meta, n_changes)?;
+    let (timestamps, _) = DeltaOfDeltaDecoder::<i64>::new(&doc.change_meta)
+        .map_err(|_| LoroError::DecodeDataCorruptionError)?
+        .take_n_finalize(n_changes)
+        .map_err(|_| LoroError::DecodeDataCorruptionError)?;
+    if timestamps.len() != n_changes {
+        return Err(LoroError::DecodeDataCorruptionError);
+    }
+    Ok((header, timestamps))
+}
+
 // MARK: decode_block_from_doc
 fn decode_header_from_doc(doc: &EncodedBlock) -> Result<ChangesBlockHeader, LoroError> {
     let EncodedBlock {

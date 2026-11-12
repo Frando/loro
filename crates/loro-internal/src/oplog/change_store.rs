@@ -35,6 +35,16 @@ use std::{
 };
 use tracing::{info_span, warn};
 mod block_encode;
+
+/// A change of an encoded block without its ops.
+pub(crate) struct ChangeMeta {
+    pub id: ID,
+    pub ctr_end: Counter,
+    pub lamport: Lamport,
+    pub timestamp: crate::change::Timestamp,
+    pub deps: Frontiers,
+}
+
 mod block_meta_encode;
 pub(super) mod iter;
 
@@ -332,6 +342,30 @@ impl ChangeStore {
         }
 
         Ok(changes)
+    }
+
+    /// The changes of a block without their ops, in block order.
+    pub(crate) fn decode_block_change_meta(bytes: &[u8]) -> LoroResult<Vec<ChangeMeta>> {
+        let (header, timestamps) = block_encode::decode_header_and_timestamps(bytes)?;
+        let mut ans = Vec::with_capacity(header.n_changes);
+        for (i, timestamp) in timestamps.into_iter().enumerate() {
+            let (Some(&start), Some(&end), Some(&lamport), Some(deps)) = (
+                header.counters.get(i),
+                header.counters.get(i + 1),
+                header.lamports.get(i),
+                header.deps_groups.get(i),
+            ) else {
+                return Err(LoroError::DecodeDataCorruptionError);
+            };
+            ans.push(ChangeMeta {
+                id: ID::new(header.peer, start),
+                ctr_end: end,
+                lamport,
+                timestamp,
+                deps: deps.clone(),
+            });
+        }
+        Ok(ans)
     }
 
     pub(crate) fn decode_block_bytes(

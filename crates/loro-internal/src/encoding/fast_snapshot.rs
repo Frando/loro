@@ -20,7 +20,7 @@ use crate::{
     OpLog, VersionVector,
 };
 use bytes::{Buf, Bytes};
-use loro_common::{HasCounterSpan, IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult};
+use loro_common::{IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult};
 
 use super::{EncodedBlobMode, ImportBlobMetadata, ParsedHeaderAndBody};
 pub(crate) const EMPTY_MARK: &[u8] = b"E";
@@ -373,11 +373,13 @@ pub(crate) fn encode_updates_in_range<W: std::io::Write>(
     oplog.export_blocks_in_range(spans, w);
 }
 
-pub(crate) fn decode_updates(oplog: &mut OpLog, body: Bytes) -> Result<Vec<Change>, LoroError> {
-    let mut reader: &[u8] = body.as_ref();
+/// Calls `f` with the byte range of each change block of an updates body.
+fn for_each_update_block(
+    body: &[u8],
+    mut f: impl FnMut(std::ops::Range<usize>) -> LoroResult<()>,
+) -> LoroResult<()> {
+    let mut reader: &[u8] = body;
     let mut index = 0;
-    let self_vv = oplog.vv();
-    let mut changes = Vec::new();
     while !reader.is_empty() {
         let old_reader_len = reader.len();
         let len = leb128::read::unsigned(&mut reader)
@@ -392,12 +394,22 @@ pub(crate) fn decode_updates(oplog: &mut OpLog, body: Bytes) -> Result<Vec<Chang
                 "decode_updates: truncated block payload".into(),
             ));
         }
-        let block_bytes = body.slice(index..end);
-        let new_changes = ChangeStore::decode_block_bytes(block_bytes, &oplog.arena, self_vv)?;
-        changes.extend(new_changes);
+        f(index..end)?;
         index = end;
         reader = &reader[len..];
     }
+    Ok(())
+}
+
+pub(crate) fn decode_updates(oplog: &mut OpLog, body: Bytes) -> Result<Vec<Change>, LoroError> {
+    let self_vv = oplog.vv();
+    let mut changes = Vec::new();
+    for_each_update_block(&body, |range| {
+        let new_changes =
+            ChangeStore::decode_block_bytes(body.slice(range), &oplog.arena, self_vv)?;
+        changes.extend(new_changes);
+        Ok(())
+    })?;
 
     changes.sort_unstable_by_key(|x| x.lamport);
     Ok(changes)
@@ -409,6 +421,87 @@ mod tests {
     use crate::{
         encoding::ExportMode, handler::HandlerTrait, utils::kv_wrapper::KvWrapper, MapHandler,
     };
+    use loro_common::HasCounterSpan;
+
+    /// The metadata of an updates blob as the full decode gives it.
+    fn meta_by_full_decode(blob: &[u8]) -> ImportBlobMetadata {
+        let parsed = crate::encoding::parse_header_and_body(blob, true).unwrap();
+        let doc = LoroDoc::new();
+        let mut oplog = doc.oplog.lock();
+        let changes = decode_updates(&mut oplog, parsed.body.to_vec().into()).unwrap();
+        let mut start_vv = VersionVector::new();
+        let mut end_vv = VersionVector::new();
+        for c in changes.iter() {
+            if start_vv.get(&c.id.peer).is_none_or(|s| *s > c.id.counter) {
+                start_vv.insert(c.id.peer, c.id.counter);
+            }
+            if end_vv.get(&c.id.peer).is_none_or(|e| *e < c.ctr_end()) {
+                end_vv.insert(c.id.peer, c.ctr_end());
+            }
+        }
+        let mut start_frontiers = Frontiers::new();
+        for c in changes.iter() {
+            for dep in c.deps().iter() {
+                match start_vv.get(&dep.peer) {
+                    Some(start) if *start > dep.counter => start_frontiers.push(dep),
+                    None if end_vv.get(&dep.peer).is_none() => start_frontiers.push(dep),
+                    _ => {}
+                }
+            }
+        }
+        ImportBlobMetadata {
+            mode: EncodedBlobMode::Updates,
+            partial_start_vv: start_vv,
+            partial_end_vv: end_vv,
+            start_timestamp: changes.first().map(|x| x.timestamp).unwrap_or(0),
+            start_frontiers,
+            end_timestamp: changes.last().map(|x| x.timestamp).unwrap_or(0),
+            change_num: changes.len() as u32,
+        }
+    }
+
+    #[test]
+    fn updates_meta_from_headers_matches_full_decode() {
+        let a = LoroDoc::new_auto_commit();
+        a.set_peer_id(1).unwrap();
+        let b = LoroDoc::new_auto_commit();
+        b.set_peer_id(2).unwrap();
+        let mut blobs = vec![];
+        for round in 0..4i64 {
+            let before = a.oplog_vv();
+            a.set_next_commit_timestamp(100 + round);
+            a.get_map("m").insert("a", round).unwrap();
+            a.get_text("t")
+                .insert(0, "hello", crate::cursor::PosType::Unicode)
+                .unwrap();
+            a.commit_then_renew();
+            b.import(&a.export(ExportMode::all_updates()).unwrap())
+                .unwrap();
+            b.set_next_commit_timestamp(200 + round);
+            b.get_list("l").push(round).unwrap();
+            b.commit_then_renew();
+            a.import(&b.export(ExportMode::all_updates()).unwrap())
+                .unwrap();
+            blobs.push(a.export(ExportMode::all_updates()).unwrap());
+            blobs.push(a.export(ExportMode::updates(&before)).unwrap());
+        }
+        for blob in blobs {
+            let got = LoroDoc::decode_import_blob_meta(&blob, true).unwrap();
+            let want = meta_by_full_decode(&blob);
+            assert_eq!(format!("{got:?}"), format!("{want:?}"));
+        }
+    }
+
+    #[test]
+    fn updates_meta_refuses_truncated_blocks() {
+        let doc = LoroDoc::new_auto_commit();
+        doc.get_map("m").insert("k", 1).unwrap();
+        doc.commit_then_renew();
+        let blob = doc.export(ExportMode::all_updates()).unwrap();
+        for cut in 23..blob.len() {
+            assert!(LoroDoc::decode_import_blob_meta(&blob[..cut], false).is_err());
+        }
+    }
 
     fn snapshot_sections(doc: &LoroDoc) -> Snapshot {
         let encoded = doc.export(ExportMode::Snapshot).unwrap();
@@ -619,9 +712,14 @@ pub(crate) fn decode_snapshot_blob_meta(
 pub(crate) fn decode_updates_blob_meta(
     parsed: ParsedHeaderAndBody,
 ) -> LoroResult<ImportBlobMetadata> {
-    let doc = LoroDoc::new();
-    let mut oplog = doc.oplog.lock();
-    let changes = decode_updates(&mut oplog, parsed.body.to_vec().into())?;
+    // The block headers and timestamps hold everything the metadata needs;
+    // the ops are not decoded.
+    let mut changes = Vec::new();
+    for_each_update_block(parsed.body, |range| {
+        changes.extend(ChangeStore::decode_block_change_meta(&parsed.body[range])?);
+        Ok(())
+    })?;
+    changes.sort_unstable_by_key(|x| x.lamport);
     let mut start_vv = VersionVector::new();
     let mut end_vv = VersionVector::new();
     for c in changes.iter() {
@@ -632,16 +730,16 @@ pub(crate) fn decode_updates_blob_meta(
             }
         }
         match end_vv.get(&c.id.peer).copied() {
-            Some(end) if end >= c.ctr_end() => {}
+            Some(end) if end >= c.ctr_end => {}
             _ => {
-                end_vv.insert(c.id.peer, c.ctr_end());
+                end_vv.insert(c.id.peer, c.ctr_end);
             }
         }
     }
 
     let mut start_frontiers = Frontiers::new();
     for c in changes.iter() {
-        for dep in c.deps().iter() {
+        for dep in c.deps.iter() {
             if let Some(start_counter) = start_vv.get(&dep.peer) {
                 if *start_counter > dep.counter {
                     start_frontiers.push(dep);
