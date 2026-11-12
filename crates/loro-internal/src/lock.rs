@@ -19,6 +19,7 @@
 //! The per-thread order tracking is debug-only; in release builds those fields
 //! and helpers are unused, hence the release-only `allow(dead_code)`.
 #![cfg_attr(not(debug_assertions), allow(dead_code))]
+#[cfg(debug_assertions)]
 use crate::sync::ThreadLocal;
 use crate::sync::{Mutex, MutexGuard};
 #[cfg(debug_assertions)]
@@ -26,6 +27,7 @@ use std::backtrace::Backtrace;
 use std::fmt::{Debug, Display};
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
+#[cfg(debug_assertions)]
 use std::sync::Arc;
 
 /// A mutex that verifies lock acquisition and release order against a group-wide
@@ -43,6 +45,7 @@ use std::sync::Arc;
 pub struct LoroMutex<T> {
     lock: Mutex<T>,
     kind: u8,
+    #[cfg(debug_assertions)]
     currently_locked_in_this_thread: Arc<ThreadLocal<Mutex<LockInfo>>>,
 }
 
@@ -78,6 +81,9 @@ impl Display for LockInfo {
 ///
 /// Use [`LoroLockGroup::new_lock`] to create locks of specific [`LockKind`].
 pub struct LoroLockGroup {
+    // Lock order is tracked in debug builds only; a release group holds
+    // nothing.
+    #[cfg(debug_assertions)]
     g: Arc<ThreadLocal<Mutex<LockInfo>>>,
 }
 
@@ -102,8 +108,10 @@ impl LoroLockGroup {
     /// Cloning the returned group is cheap. All locks created from clones of
     /// the same group still share the same ordering domain.
     pub fn new() -> Self {
-        let g = Arc::new(ThreadLocal::new());
-        LoroLockGroup { g }
+        LoroLockGroup {
+            #[cfg(debug_assertions)]
+            g: Arc::new(ThreadLocal::new()),
+        }
     }
 
     /// Create a new lock associated with this group and [`LockKind`].
@@ -112,6 +120,7 @@ impl LoroLockGroup {
     pub fn new_lock<T>(&self, value: T, kind: LockKind) -> LoroMutex<T> {
         LoroMutex {
             lock: Mutex::new(value),
+            #[cfg(debug_assertions)]
             currently_locked_in_this_thread: self.g.clone(),
             kind: kind as u8,
         }

@@ -25,9 +25,9 @@ pub use loom::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicU
 #[cfg(not(loom))]
 pub use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize};
 
-#[cfg(loom)]
+#[cfg(all(loom, debug_assertions))]
 pub(crate) use my_thread_local::ThreadLocal;
-#[cfg(not(loom))]
+#[cfg(all(not(loom), debug_assertions))]
 pub(crate) use thread_local::ThreadLocal;
 
 fn expect_not_poisoned<T>(result: raw::LockResult<T>, lock_kind: &str) -> T {
@@ -113,7 +113,7 @@ impl<T: Default> Default for RwLock<T> {
     }
 }
 
-#[cfg(loom)]
+#[cfg(all(loom, debug_assertions))]
 mod my_thread_local {
     use std::sync::Arc;
 
