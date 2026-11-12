@@ -803,6 +803,10 @@ impl OpLog {
         to: &VersionVector,
     ) -> Option<Vec<Frontiers>> {
         let mut uncovered = Vec::new();
+        if from.is_empty() {
+            // Every parents' vv includes the empty version.
+            return Some(uncovered);
+        }
         for (peer, span) in from.diff(to).forward.iter() {
             let id_span = IdSpan::new(*peer, span.start, span.end);
             for change in self.change_store.iter_changes(id_span) {
