@@ -7,14 +7,26 @@ use crate::LoroDoc;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Arc;
 
+/// The settings of a document, shared by its clones.
 #[derive(Clone, Debug)]
-pub struct Configure {
+pub struct Configure(Arc<ConfigureInner>);
+
+#[derive(Debug)]
+pub struct ConfigureInner {
     pub(crate) text_style_config: Arc<RwLock<StyleConfigMap>>,
-    record_timestamp: Arc<AtomicBool>,
+    record_timestamp: AtomicBool,
     pub(crate) merge_interval_in_s: Arc<AtomicI64>,
-    pub(crate) editable_detached_mode: Arc<AtomicBool>,
-    pub(crate) deleted_root_containers: Arc<Mutex<FxHashSet<ContainerID>>>,
-    pub(crate) hide_empty_root_containers: Arc<AtomicBool>,
+    pub(crate) editable_detached_mode: AtomicBool,
+    pub(crate) deleted_root_containers: Mutex<FxHashSet<ContainerID>>,
+    pub(crate) hide_empty_root_containers: AtomicBool,
+}
+
+impl std::ops::Deref for Configure {
+    type Target = ConfigureInner;
+
+    fn deref(&self) -> &ConfigureInner {
+        &self.0
+    }
 }
 
 impl LoroDoc {
@@ -28,41 +40,39 @@ impl LoroDoc {
 
 impl Default for Configure {
     fn default() -> Self {
-        Self {
+        Self(Arc::new(ConfigureInner {
             text_style_config: Arc::new(RwLock::new(StyleConfigMap::default_rich_text_config())),
-            record_timestamp: Arc::new(AtomicBool::new(false)),
-            editable_detached_mode: Arc::new(AtomicBool::new(false)),
+            record_timestamp: AtomicBool::new(false),
+            editable_detached_mode: AtomicBool::new(false),
             merge_interval_in_s: Arc::new(AtomicI64::new(1000)),
-            deleted_root_containers: Arc::new(Mutex::new(Default::default())),
-            hide_empty_root_containers: Arc::new(AtomicBool::new(false)),
-        }
+            deleted_root_containers: Mutex::new(Default::default()),
+            hide_empty_root_containers: AtomicBool::new(false),
+        }))
     }
 }
 
 impl Configure {
     pub fn fork(&self) -> Self {
-        Self {
+        Self(Arc::new(ConfigureInner {
             text_style_config: Arc::new(RwLock::new(self.text_style_config.read().clone())),
-            record_timestamp: Arc::new(AtomicBool::new(
+            record_timestamp: AtomicBool::new(
                 self.record_timestamp
                     .load(std::sync::atomic::Ordering::Relaxed),
-            )),
+            ),
             merge_interval_in_s: Arc::new(AtomicI64::new(
                 self.merge_interval_in_s
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
-            editable_detached_mode: Arc::new(AtomicBool::new(
+            editable_detached_mode: AtomicBool::new(
                 self.editable_detached_mode
                     .load(std::sync::atomic::Ordering::Relaxed),
-            )),
-            deleted_root_containers: Arc::new(Mutex::new(
-                self.deleted_root_containers.lock().clone(),
-            )),
-            hide_empty_root_containers: Arc::new(AtomicBool::new(
+            ),
+            deleted_root_containers: Mutex::new(self.deleted_root_containers.lock().clone()),
+            hide_empty_root_containers: AtomicBool::new(
                 self.hide_empty_root_containers
                     .load(std::sync::atomic::Ordering::Relaxed),
-            )),
-        }
+            ),
+        }))
     }
 
     pub fn text_style_config(&self) -> &Arc<RwLock<StyleConfigMap>> {

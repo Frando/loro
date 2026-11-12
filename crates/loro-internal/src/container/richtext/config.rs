@@ -49,7 +49,15 @@ impl StyleConfigMap {
         }
     }
 
+    /// The default styles of rich text: bold, italic, underline, link,
+    /// highlight, comment and code. Built once, then cloned.
     pub fn default_rich_text_config() -> Self {
+        static DEFAULT: std::sync::LazyLock<StyleConfigMap> =
+            std::sync::LazyLock::new(StyleConfigMap::build_default_rich_text_config);
+        DEFAULT.clone()
+    }
+
+    fn build_default_rich_text_config() -> Self {
         let mut map = Self {
             map: FxHashMap::default(),
             default_style: None,

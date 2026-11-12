@@ -1315,8 +1315,8 @@ impl DocState {
     pub fn get_deep_value(&mut self) -> LoroValue {
         let roots = self.preferred_root_containers();
         let mut ans = FxHashMap::with_capacity_and_hasher(roots.len(), Default::default());
-        let binding = self.config.deleted_root_containers.clone();
-        let deleted_root_container = binding.lock();
+        let binding = self.config.clone();
+        let deleted_root_container = binding.deleted_root_containers.lock();
         let should_hide_empty_root_container = self
             .config
             .hide_empty_root_containers
