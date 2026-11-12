@@ -373,7 +373,12 @@ impl ChangeStore {
         arena: &SharedArena,
         self_vv: &VersionVector,
     ) -> LoroResult<Vec<Change>> {
-        let mut ans = ChangesBlockBytes::new(bytes).parse(arena)?;
+        // One pass over the block: the header is decoded from the same parse
+        // as the ops, and not kept.
+        let mut ans = decode_block(&bytes, arena, None)?;
+        for c in ans.iter() {
+            register_container_and_parent_link(arena, c)
+        }
         if ans.is_empty() {
             return Ok(ans);
         }
