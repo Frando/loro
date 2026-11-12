@@ -291,8 +291,50 @@ impl ContainerState for MapState {
         Diff::Map(resolved_delta)
     }
 
-    fn apply_diff(&mut self, diff: InternalDiff, ctx: DiffApplyContext) -> LoroResult<()> {
-        let _ = self.apply_diff_and_convert(diff, ctx);
+    /// The state change of [`Self::apply_diff_and_convert`] without the
+    /// event: no resolved delta, no handlers, no value clones. Container
+    /// values (and mergeable markers, as containers) are still registered
+    /// in the arena, as the handlers of the event would register them.
+    fn apply_diff(
+        &mut self,
+        diff: InternalDiff,
+        DiffApplyContext { doc, mode }: DiffApplyContext,
+    ) -> LoroResult<()> {
+        let InternalDiff::Map(delta) = diff else {
+            unreachable!()
+        };
+        let force = matches!(mode, DiffMode::Checkout | DiffMode::Linear);
+        let mut doc_and_parent = None;
+        for (key, value) in delta.updated.into_iter() {
+            let Some(value) = value else {
+                // uncreate op
+                assert_eq!(mode, DiffMode::Checkout);
+                self.remove(&key);
+                continue;
+            };
+
+            if !force && matches!(self.map.get(&key), Some(old_value) if old_value > &value) {
+                continue;
+            }
+
+            if matches!(
+                value.value,
+                Some(LoroValue::Container(_) | LoroValue::Binary(_))
+            ) {
+                let (doc, parent_id) = doc_and_parent.get_or_insert_with(|| {
+                    let doc = doc.upgrade().unwrap();
+                    let parent_id = doc.arena.idx_to_id(self.idx);
+                    (doc, parent_id)
+                });
+                let v = value.value.clone().unwrap();
+                if let LoroValue::Container(c) = translate_with_parent(parent_id.as_ref(), &key, v)
+                {
+                    doc.arena.register_container(&c);
+                }
+            }
+            self.insert(key, value);
+        }
+
         Ok(())
     }
 
