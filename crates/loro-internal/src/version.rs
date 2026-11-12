@@ -14,6 +14,7 @@ use smallvec::SmallVec;
 use std::{
     cmp::Ordering,
     ops::{ControlFlow, Deref, DerefMut},
+    sync::Arc,
 };
 
 /// [VersionVector](https://en.wikipedia.org/wiki/Version_vector)
@@ -154,13 +155,84 @@ impl VersionRange {
 
 /// Immutable version vector
 ///
-/// It has O(1) clone time and O(logN) insert/delete/lookup time.
+/// It has O(1) clone time. Up to [`IM_VV_SMALL`] peers it is a shared
+/// slice (lookups and updates scan and copy it); beyond that a persistent
+/// hash map with O(logN) insert/delete/lookup time. The empty vector does
+/// not allocate.
 ///
 /// It's more memory efficient than [VersionVector] when the version vector
 /// can be created from cloning and modifying other similar version vectors.
-#[repr(transparent)]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ImVersionVector(im::HashMap<PeerID, Counter, rustc_hash::FxBuildHasher>);
+#[derive(Clone, Default)]
+pub struct ImVersionVector(ImVv);
+
+/// The most peers an [`ImVersionVector`] keeps in a slice.
+const IM_VV_SMALL: usize = 16;
+
+#[derive(Clone, Default)]
+enum ImVv {
+    #[default]
+    Empty,
+    Small(Arc<[(PeerID, Counter)]>),
+    Large(im::HashMap<PeerID, Counter, rustc_hash::FxBuildHasher>),
+}
+
+/// An iterator over the entries of an [`ImVersionVector`].
+pub enum ImVersionVectorIter<'a> {
+    Small(std::slice::Iter<'a, (PeerID, Counter)>),
+    Large(im::hashmap::Iter<'a, PeerID, Counter>),
+}
+
+impl std::fmt::Debug for ImVersionVectorIter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ImVersionVectorIter")
+    }
+}
+
+impl<'a> Iterator for ImVersionVectorIter<'a> {
+    type Item = (&'a PeerID, &'a Counter);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            ImVersionVectorIter::Small(it) => it.next().map(|(p, c)| (p, c)),
+            ImVersionVectorIter::Large(it) => it.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            ImVersionVectorIter::Small(it) => it.size_hint(),
+            ImVersionVectorIter::Large(it) => it.size_hint(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ImVersionVector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Entries<'a>(&'a ImVersionVector);
+        impl std::fmt::Debug for Entries<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_map().entries(self.0.iter()).finish()
+            }
+        }
+        f.debug_tuple("ImVersionVector")
+            .field(&Entries(self))
+            .finish()
+    }
+}
+
+impl Serialize for ImVersionVector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for ImVersionVector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let map = FxHashMap::<PeerID, Counter>::deserialize(deserializer)?;
+        Ok(Self::from_entries(map.into_iter()))
+    }
+}
 
 #[inline]
 fn normalize_vv_counter(counter: Counter) -> Counter {
@@ -174,43 +246,101 @@ fn last_id_to_vv_end(id: ID) -> Counter {
 
 impl ImVersionVector {
     pub fn new() -> Self {
-        Self(Default::default())
+        Self(ImVv::Empty)
+    }
+
+    /// A vector of `entries`, whose peers are distinct.
+    fn from_entries(entries: impl ExactSizeIterator<Item = (PeerID, Counter)>) -> Self {
+        match entries.len() {
+            0 => Self(ImVv::Empty),
+            n if n <= IM_VV_SMALL => Self(ImVv::Small(entries.collect())),
+            _ => Self(ImVv::Large(entries.collect())),
+        }
     }
 
     pub fn clear(&mut self) {
-        self.0.clear()
+        self.0 = ImVv::Empty;
     }
 
     pub fn get(&self, key: &PeerID) -> Option<&Counter> {
-        self.0.get(key)
+        match &self.0 {
+            ImVv::Empty => None,
+            ImVv::Small(s) => s.iter().find(|(p, _)| p == key).map(|(_, c)| c),
+            ImVv::Large(m) => m.get(key),
+        }
     }
 
     pub fn get_mut(&mut self, key: &PeerID) -> Option<&mut Counter> {
-        self.0.get_mut(key)
+        match &mut self.0 {
+            ImVv::Empty => None,
+            ImVv::Small(s) => {
+                let i = s.iter().position(|(p, _)| p == key)?;
+                Some(&mut Arc::make_mut(s)[i].1)
+            }
+            ImVv::Large(m) => m.get_mut(key),
+        }
     }
 
     pub fn insert(&mut self, k: PeerID, v: Counter) {
-        self.0.insert(k, v);
+        if let Some(c) = self.get_mut(&k) {
+            *c = v;
+            return;
+        }
+        match &mut self.0 {
+            ImVv::Empty => self.0 = ImVv::Small(Arc::new([(k, v)])),
+            ImVv::Small(s) if s.len() < IM_VV_SMALL => {
+                self.0 = ImVv::Small(s.iter().copied().chain([(k, v)]).collect());
+            }
+            ImVv::Small(s) => {
+                let mut m: im::HashMap<_, _, _> = s.iter().copied().collect();
+                m.insert(k, v);
+                self.0 = ImVv::Large(m);
+            }
+            ImVv::Large(m) => {
+                m.insert(k, v);
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len() == 0
     }
 
-    pub fn iter(&self) -> im::hashmap::Iter<'_, PeerID, Counter> {
-        self.0.iter()
+    pub fn iter(&self) -> ImVersionVectorIter<'_> {
+        match &self.0 {
+            ImVv::Empty => ImVersionVectorIter::Small([].iter()),
+            ImVv::Small(s) => ImVersionVectorIter::Small(s.iter()),
+            ImVv::Large(m) => ImVersionVectorIter::Large(m.iter()),
+        }
     }
 
     pub fn remove(&mut self, k: &PeerID) -> Option<Counter> {
-        self.0.remove(k)
+        match &mut self.0 {
+            ImVv::Empty => None,
+            ImVv::Small(s) => {
+                let i = s.iter().position(|(p, _)| p == k)?;
+                let old = s[i].1;
+                self.0 = if s.len() == 1 {
+                    ImVv::Empty
+                } else {
+                    ImVv::Small(s.iter().copied().filter(|(p, _)| p != k).collect())
+                };
+                Some(old)
+            }
+            ImVv::Large(m) => m.remove(k),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        match &self.0 {
+            ImVv::Empty => 0,
+            ImVv::Small(s) => s.len(),
+            ImVv::Large(m) => m.len(),
+        }
     }
 
     pub fn contains_key(&self, k: &PeerID) -> bool {
-        self.0.contains_key(k)
+        self.get(k).is_some()
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -223,11 +353,11 @@ impl ImVersionVector {
     }
 
     pub fn to_vv(&self) -> VersionVector {
-        VersionVector(self.0.iter().map(|(&k, &v)| (k, v)).collect())
+        VersionVector(self.iter().map(|(&k, &v)| (k, v)).collect())
     }
 
     pub fn from_vv(vv: &VersionVector) -> Self {
-        ImVersionVector(vv.0.iter().map(|(&k, &v)| (k, v)).collect())
+        Self::from_entries(vv.0.iter().map(|(&k, &v)| (k, v)))
     }
 
     pub fn extend_to_include_vv<'a>(
@@ -240,20 +370,20 @@ impl ImVersionVector {
                 continue;
             }
 
-            if let Some(my_counter) = self.0.get_mut(&client_id) {
+            if let Some(my_counter) = self.get_mut(&client_id) {
                 *my_counter = normalize_vv_counter(*my_counter);
                 if *my_counter < counter {
                     *my_counter = counter;
                 }
             } else {
-                self.0.insert(client_id, counter);
+                self.insert(client_id, counter);
             }
         }
     }
 
     #[inline]
     pub fn merge(&mut self, other: &Self) {
-        self.extend_to_include_vv(other.0.iter());
+        self.extend_to_include_vv(other.iter());
     }
 
     #[inline]
@@ -265,9 +395,9 @@ impl ImVersionVector {
     pub fn set_last(&mut self, id: ID) {
         let end = last_id_to_vv_end(id);
         if end == 0 {
-            self.0.remove(&id.peer);
+            self.remove(&id.peer);
         } else {
-            self.0.insert(id.peer, end);
+            self.insert(id.peer, end);
         }
     }
 
@@ -277,13 +407,13 @@ impl ImVersionVector {
             return;
         }
 
-        if let Some(counter) = self.0.get_mut(&id.peer) {
+        if let Some(counter) = self.get_mut(&id.peer) {
             *counter = normalize_vv_counter(*counter);
             if *counter < end {
                 *counter = end;
             }
         } else {
-            self.0.insert(id.peer, end);
+            self.insert(id.peer, end);
         }
     }
 
@@ -310,12 +440,10 @@ impl Eq for VersionVector {}
 
 impl PartialEq for ImVersionVector {
     fn eq(&self, other: &Self) -> bool {
-        self.0.iter().all(|(client, counter)| {
-            normalize_vv_counter(*other.0.get(client).unwrap_or(&0))
-                == normalize_vv_counter(*counter)
-        }) && other.0.iter().all(|(client, counter)| {
-            normalize_vv_counter(*self.0.get(client).unwrap_or(&0))
-                == normalize_vv_counter(*counter)
+        self.iter().all(|(client, counter)| {
+            normalize_vv_counter(*other.get(client).unwrap_or(&0)) == normalize_vv_counter(*counter)
+        }) && other.iter().all(|(client, counter)| {
+            normalize_vv_counter(*self.get(client).unwrap_or(&0)) == normalize_vv_counter(*counter)
         })
     }
 }
@@ -695,9 +823,9 @@ impl VersionVector {
     pub fn set_last(&mut self, id: ID) {
         let end = last_id_to_vv_end(id);
         if end == 0 {
-            self.0.remove(&id.peer);
+            self.remove(&id.peer);
         } else {
-            self.0.insert(id.peer, end);
+            self.insert(id.peer, end);
         }
     }
 
@@ -843,7 +971,7 @@ impl VersionVector {
                     *my_counter = counter;
                 }
             } else {
-                self.0.insert(client_id, counter);
+                self.insert(client_id, counter);
             }
         }
     }
@@ -983,11 +1111,11 @@ impl VersionVector {
     }
 
     pub fn to_im_vv(&self) -> ImVersionVector {
-        ImVersionVector(self.0.iter().map(|(&k, &v)| (k, v)).collect())
+        ImVersionVector::from_vv(self)
     }
 
     pub fn from_im_vv(im_vv: &ImVersionVector) -> Self {
-        VersionVector(im_vv.0.iter().map(|(&k, &v)| (k, v)).collect())
+        im_vv.to_vv()
     }
 }
 
@@ -1183,6 +1311,45 @@ mod tests {
         let im_vv = vv.to_im_vv();
         let decoded_vv = VersionVector::from_im_vv(&im_vv);
         assert_eq!(vv, decoded_vv);
+    }
+
+    #[test]
+    fn im_version_vector_matches_version_vector_across_sizes() {
+        let mut im = ImVersionVector::new();
+        let mut vv = VersionVector::new();
+        for i in 0..(IM_VV_SMALL as u64 * 3) {
+            im.insert(i % 40, i as Counter);
+            vv.insert(i % 40, i as Counter);
+            if i % 5 == 0 {
+                assert_eq!(im.remove(&(i / 2)), vv.remove(&(i / 2)));
+            }
+            if let Some(c) = im.get_mut(&(i / 3)) {
+                *c += 1;
+                *vv.get_mut(&(i / 3)).unwrap() += 1;
+            }
+            assert_eq!(im.len(), vv.len());
+            assert_eq!(im.to_vv(), vv);
+            assert_eq!(ImVersionVector::from_vv(&vv), im);
+            let bytes = postcard::to_allocvec(&im).unwrap();
+            assert_eq!(ImVersionVector::decode(&bytes).unwrap(), im);
+            assert_eq!(VersionVector::decode(&bytes).unwrap(), vv);
+        }
+        while let Some((&peer, _)) = vv.iter().next() {
+            assert_eq!(im.remove(&peer), vv.remove(&peer));
+        }
+        assert!(im.is_empty());
+    }
+
+    #[test]
+    fn im_version_vector_clones_are_independent() {
+        let a = VersionVector::from_iter([(1, 1), (2, 2)]).to_im_vv();
+        let mut b = a.clone();
+        *b.get_mut(&1).unwrap() = 5;
+        b.insert(3, 3);
+        assert_eq!(a.get(&1), Some(&1));
+        assert_eq!(a.get(&3), None);
+        assert_eq!(b.get(&1), Some(&5));
+        assert!(format!("{a:?}").starts_with("ImVersionVector({"));
     }
 
     #[test]
