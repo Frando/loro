@@ -17,6 +17,7 @@ use super::pending_changes::ClaimedSpans;
 use crate::{
     arena::SharedArena,
     change::Change,
+    change::Timestamp,
     container::list::list_op::InnerListOp,
     dag::Dag,
     op::{InnerContent, Op},
@@ -26,6 +27,11 @@ use crate::{
 
 #[cfg(feature = "counter")]
 use crate::op::FutureInnerContent;
+
+/// The largest absolute timestamp of an imported change: 2^62 - 1, so that the
+/// difference of any two timestamps fits an `i64`. Clock timestamps are far
+/// below it.
+pub(crate) const MAX_ABS_TIMESTAMP: Timestamp = (1 << 62) - 1;
 
 /// How to compare imported op values with known history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,10 +172,32 @@ impl OpLog {
                 false
             }
         });
+        Self::check_timestamps(&changes)?;
         Self::check_own_peer_deps(&changes)?;
         self.check_changes_do_not_skip_counters(&changes)?;
         self.check_changes_include_predecessors(&changes)?;
         Ok(changes)
+    }
+
+    /// The timestamp of every change is within [`MAX_ABS_TIMESTAMP`] of 0, so
+    /// that the difference of two timestamps fits an `i64`. The change store
+    /// subtracts timestamps when it merges two changes and when it
+    /// delta-encodes a block on export; far-apart timestamps of crafted
+    /// changes overflowed there.
+    fn check_timestamps(changes: &[Change]) -> LoroResult<()> {
+        if let Some(change) = changes
+            .iter()
+            .find(|c| !(-MAX_ABS_TIMESTAMP..=MAX_ABS_TIMESTAMP).contains(&c.timestamp))
+        {
+            return Err(LoroError::DecodeError(
+                format!(
+                    "Invalid change {}: timestamp {} is out of range",
+                    change.id, change.timestamp
+                )
+                .into_boxed_str(),
+            ));
+        }
+        Ok(())
     }
 
     /// A change of peer `p` at counter `c` can depend on its own peer only through
