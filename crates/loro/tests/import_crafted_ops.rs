@@ -103,6 +103,7 @@ fn import_both(json: &str) -> Vec<Result<(), String>> {
     results
 }
 
+const T: &str = "cid:root-t:Text";
 const TR: &str = "cid:root-tr:Tree";
 
 fn assert_imports(json: &str) {
@@ -287,4 +288,31 @@ fn honest_tree_edits_still_apply() {
         x.get_tree("tr").parent(TreeID::new(1, 15)),
         Some(loro::TreeParentId::Node(n))
     );
+}
+
+// Op contents checked before the ops reach the oplog.
+
+fn mark(start: u32, end: u32) -> Value {
+    json!({"type":"mark","start":start,"end":end,"style_key":"b","style_value":true,"info":132})
+}
+
+fn assert_import_error(json: &str) {
+    for r in import_both(json) {
+        assert!(r.is_err(), "expected an import error");
+    }
+}
+
+/// A mark whose start is not below its end failed an assertion of the
+/// rich-text diff calculator under the document's locks.
+#[test]
+fn a_mark_with_start_not_below_end_is_an_import_error() {
+    let base = base_doc();
+    for (start, end) in [(4, 1), (2, 2)] {
+        let json = crafted(
+            &base,
+            &[(T, mark(start, end)), (T, json!({"type":"mark_end"}))],
+            &[],
+        );
+        assert_import_error(&json);
+    }
 }

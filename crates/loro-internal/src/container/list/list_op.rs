@@ -88,7 +88,8 @@ impl ListOp<'_> {
 }
 
 impl InnerListOp {
-    /// Reject positions that no real sequence can reach.
+    /// Reject positions that no real sequence can reach, and styles over an empty or
+    /// reversed range.
     ///
     /// Diff calculation replays ops on a tracker whose unreplayed history is one
     /// placeholder span of [`UNKNOWN_SPAN_LEN`] items, and positions past it panic
@@ -105,8 +106,10 @@ impl InnerListOp {
                 in_range(span.start() as i64) && in_range(span.last() as i64)
             }
             InnerListOp::Move { from, to, .. } => in_range(*from as i64) && in_range(*to as i64),
+            // A style covers at least one item. Local marks refuse an empty range, and the
+            // rich-text diff calculator asserts it.
             InnerListOp::StyleStart { start, end, .. } => {
-                in_range(*start as i64) && in_range(*end as i64)
+                start < end && in_range(*start as i64) && in_range(*end as i64)
             }
             InnerListOp::Set { .. } | InnerListOp::StyleEnd => true,
         };
