@@ -293,12 +293,11 @@ impl ArenaContainers {
                 break d;
             }
             chain.push(c);
-            // A chain longer than the arena means the parent links form a cycle.
-            assert!(
-                chain.len() <= self.container_idx_to_id.len(),
-                "InternalError: the parent links of {:?} form a cycle",
-                self.container_id(target)
-            );
+            // A chain longer than the arena means the parent links form a cycle. Crafted
+            // ops of two peers can link containers into one; they have no depth.
+            if chain.len() > self.container_idx_to_id.len() {
+                return None;
+            }
             match self.parent_for_depth(c)? {
                 Some(p) => c = p,
                 None => {
@@ -646,13 +645,28 @@ impl SharedArena {
         self.inner.containers.read().parents.get(&child).copied()
     }
 
+    /// Whether a walk up the parent links that took `steps` steps is in a cycle: it is
+    /// longer than the arena. Only crafted ops of two peers can link containers into a
+    /// cycle. Cheap for the short walks of honest documents.
+    pub(crate) fn walk_is_in_a_cycle(&self, steps: usize) -> bool {
+        steps > 1024 && steps > self.inner.containers.read().container_idx_to_id.len() + 1
+    }
+
     /// Call `f` on each ancestor of `container`, including `container` itself.
     ///
     /// f(ContainerIdx, is_first)
+    ///
+    /// Stops when the walk is longer than the arena, so a parent cycle from crafted ops
+    /// cannot loop forever.
     pub fn with_ancestors(&self, container: ContainerIdx, mut f: impl FnMut(ContainerIdx, bool)) {
         let mut container = Some(container);
         let mut is_first = true;
+        let mut steps = 0;
         while let Some(c) = container {
+            steps += 1;
+            if self.walk_is_in_a_cycle(steps) {
+                break;
+            }
             f(c, is_first);
             is_first = false;
             container = self.get_parent(c)
@@ -870,12 +884,11 @@ impl SharedArena {
             steps += 1;
             {
                 let containers = self.inner.containers.read();
-                // Resolving may register ancestors, so compare with the current size.
-                assert!(
-                    steps <= containers.container_idx_to_id.len() + 1,
-                    "InternalError: the parent links of {:?} form a cycle",
-                    containers.container_id(container)
-                );
+                // Resolving may register ancestors, so compare with the current size. A
+                // cycle (crafted ops of two peers) has no depth.
+                if steps > containers.container_idx_to_id.len() + 1 {
+                    return None;
+                }
                 if containers.depth[c.to_index() as usize].is_some() {
                     break;
                 }
@@ -1047,9 +1060,9 @@ mod tests {
         }
     }
 
+    /// Crafted ops of two peers can link containers into a cycle. They have no depth.
     #[test]
-    #[should_panic(expected = "form a cycle")]
-    fn a_parent_cycle_fails_fast() {
+    fn a_parent_cycle_has_no_depth() {
         let arena = SharedArena::new();
         let a =
             arena.register_container(&ContainerID::new_normal(ID::new(1, 0), ContainerType::Map));
@@ -1057,7 +1070,10 @@ mod tests {
             arena.register_container(&ContainerID::new_normal(ID::new(1, 1), ContainerType::Map));
         arena.set_parent(a, Some(b));
         arena.set_parent(b, Some(a));
-        arena.get_depth(a);
+        assert_eq!(arena.get_depth(a), None);
+        let mut ancestors = 0;
+        arena.with_ancestors(a, |_, _| ancestors += 1);
+        assert!(ancestors <= 1026);
     }
 
     /// Without an op log to ask, an unknown parent is still an internal error.

@@ -60,6 +60,10 @@ impl DocState {
         let mut depends_on_mergeable_edge = false;
         // The parent that no longer holds the chain, if any.
         let (is_deleted, cut_at) = loop {
+            if self.arena.walk_is_in_a_cycle(visited.len()) {
+                // A parent cycle (from crafted ops) never reaches a root.
+                break (true, None);
+            }
             let id = self.arena.idx_to_id(idx).unwrap();
             if id.is_mergeable() {
                 depends_on_mergeable_edge = true;

@@ -2246,7 +2246,13 @@ impl DocState {
         }
 
         let mut idx = self.arena.id_to_idx(id).unwrap();
+        let mut steps = 0;
         loop {
+            steps += 1;
+            if self.arena.walk_is_in_a_cycle(steps) {
+                // A parent cycle (from crafted ops) never reaches a root.
+                return false;
+            }
             let id = self.arena.idx_to_id(idx).unwrap();
             if let Some(parent_idx) = self.arena.get_parent(idx) {
                 if !self.contains_logical_child(parent_idx, &id) {
@@ -2266,7 +2272,12 @@ impl DocState {
     /// A missing mergeable marker can return at the same id. A broken normal
     /// edge instead requires recreation, whose full state supplies its edits.
     fn is_hidden_only_by_mergeable_edges(&mut self, mut idx: ContainerIdx) -> bool {
+        let mut steps = 0;
         loop {
+            steps += 1;
+            if self.arena.walk_is_in_a_cycle(steps) {
+                return false;
+            }
             let id = self.arena.idx_to_id(idx).unwrap();
             if let Some(parent) = self.arena.get_parent(idx) {
                 if !self.contains_logical_child(parent, &id) && !id.is_mergeable() {
@@ -2284,6 +2295,10 @@ impl DocState {
         let mut ans = Vec::new();
         let mut idx = idx;
         loop {
+            if self.arena.walk_is_in_a_cycle(ans.len() + 1) {
+                // A parent cycle (from crafted ops) never reaches a root.
+                return None;
+            }
             let id = self.arena.idx_to_id(idx).unwrap();
             if let Some(parent_idx) = self.arena.get_parent(idx) {
                 let Some(prop) = self.get_logical_child_index(parent_idx, &id) else {
