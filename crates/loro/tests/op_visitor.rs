@@ -65,9 +65,7 @@ fn own(op: &OpView<'_>) -> Content {
         OpContentView::MarkEnd => Content::MarkEnd,
         OpContentView::Move { from, to, elem } => Content::Move(*from, *to, *elem),
         OpContentView::Set { elem, value } => Content::Set(*elem, (*value).clone()),
-        OpContentView::MapSet { key, value } => {
-            Content::MapSet(key.to_string(), value.cloned())
-        }
+        OpContentView::MapSet { key, value } => Content::MapSet(key.to_string(), value.cloned()),
         OpContentView::TreeCreate {
             target,
             parent,

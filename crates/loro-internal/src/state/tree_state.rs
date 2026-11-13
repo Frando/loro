@@ -2016,8 +2016,8 @@ mod snapshot {
             let encoded: EncodedTree = serde_columnar::from_bytes(bytes).map_err(|err| {
                 state_decode_error(format!("Decode tree state failed: invalid metadata: {err}"))
             })?;
-            let fractional_indexes =
-                PositionArena::decode(&encoded.fractional_indexes)?.try_parse_to_positions()?;
+            let fractional_indexes = PositionArena::decode(&encoded.fractional_indexes)?
+                .try_parse_to_positions(bytes.len())?;
             if encoded.node_ids.len() != encoded.nodes.len() {
                 return Err(state_decode_error(
                     "Decode tree state failed: node id/node length mismatch",

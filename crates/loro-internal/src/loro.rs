@@ -4568,10 +4568,7 @@ impl BatchImportGuard<'_> {
             // The blobs were imported while detached inside this scope, so their
             // op references (movable-list elements, style end anchors) are validated
             // here, once per batch.
-            let validation = doc
-                .oplog
-                .lock()
-                .validate_op_refs_in_import_scope();
+            let validation = doc.oplog.lock().validate_op_refs_in_import_scope();
             checkout = validation.and_then(|()| doc._checkout_to_latest_without_commit(true));
             if let Err(e) = &checkout {
                 // Validation precedes mutation: state is still at its pre-batch

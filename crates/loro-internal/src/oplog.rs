@@ -354,7 +354,10 @@ impl OpLog {
             for op in change.ops.iter() {
                 let prev = prev_op.replace(op);
                 if op.container.get_type() == ContainerType::Text
-                    && matches!(op.content, InnerContent::List(list_op::InnerListOp::StyleEnd))
+                    && matches!(
+                        op.content,
+                        InnerContent::List(list_op::InnerListOp::StyleEnd)
+                    )
                 {
                     // Honest peers emit the `StyleStart` right before its `StyleEnd`,
                     // so this is the common case and needs no history lookup.
@@ -1618,7 +1621,8 @@ impl OpLog {
             // finds the style in the shallow root state.
             return Ok(!self.dag.shallow_since_vv().is_empty()
                 && self.with_history_cache(|h| {
-                    h.find_text_style_end_in_shallow_root(r.container, start_id).is_some()
+                    h.find_text_style_end_in_shallow_root(r.container, start_id)
+                        .is_some()
                 }));
         };
         Ok(start_op.container == r.container

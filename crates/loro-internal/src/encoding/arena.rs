@@ -165,6 +165,21 @@ pub(super) struct PositionDelta<'a> {
     rest: Cow<'a, [u8]>,
 }
 
+/// Bytes of expanded positions a [`PositionArena`] may yield per byte of
+/// its input.
+///
+/// Honest positions grow by about one byte per 127 inserts into one gap
+/// (jitter 0) and cost about 6 to 11 encoded bytes each with their op or
+/// node: 60,000 inserts into one gap expand 41 to 43 times in a change
+/// block or a tree snapshot. 256 admits positions of about 2.5 KiB,
+/// some 300,000 inserts into one gap, and keeps a crafted arena (one long
+/// position, then many rows with its full prefix and an empty rest) from
+/// allocating gigabytes out of a few kilobytes.
+pub(crate) const MAX_POSITION_EXPANSION: usize = 256;
+
+/// Bytes of expanded positions any arena may yield, whatever its size.
+const MIN_POSITION_BUDGET: usize = 64 * 1024;
+
 #[derive(Default)]
 #[columnar(ser, de)]
 pub(crate) struct PositionArena<'a> {
@@ -189,7 +204,18 @@ impl<'a> PositionArena<'a> {
         Self { positions: ans }
     }
 
-    pub fn try_parse_to_positions(self) -> LoroResult<Vec<Vec<u8>>> {
+    /// Expands the prefix-compressed positions.
+    ///
+    /// A row copies a prefix of the row before it, so a few input bytes
+    /// can name a long position again and again. `encoded_len` is the
+    /// size of the input the arena came from; the expanded positions may
+    /// take at most [`MAX_POSITION_EXPANSION`] bytes per input byte, and
+    /// more is a decode error, refused before it is allocated.
+    pub fn try_parse_to_positions(self, encoded_len: usize) -> LoroResult<Vec<Vec<u8>>> {
+        let budget = encoded_len
+            .saturating_mul(MAX_POSITION_EXPANSION)
+            .max(MIN_POSITION_BUDGET);
+        let mut total = 0usize;
         let mut ans: Vec<Vec<u8>> = Vec::with_capacity(self.positions.len());
         for PositionDelta {
             common_prefix_length,
@@ -218,6 +244,12 @@ impl<'a> PositionArena<'a> {
                         "Decode position arena failed: position length overflow".into(),
                     )
                 })?;
+            total = total.saturating_add(capacity);
+            if total > budget {
+                return Err(LoroError::DecodeError(
+                    "Decode position arena failed: positions expand too far".into(),
+                ));
+            }
             let mut p = Vec::with_capacity(capacity);
             if let Some(last_bytes) = ans.last() {
                 p.extend_from_slice(&last_bytes[0..common_prefix_length]);
@@ -272,6 +304,36 @@ mod tests {
             }],
         };
 
-        assert!(arena.try_parse_to_positions().is_err());
+        assert!(arena.try_parse_to_positions(0).is_err());
+    }
+
+    /// One 1 MiB position, then rows that repeat it with an empty rest:
+    /// a few bytes each, refused before they are expanded.
+    #[test]
+    fn position_arena_refuses_a_crafted_expansion() {
+        let long = vec![0x80u8; 1024 * 1024];
+        let mut positions = vec![PositionDelta {
+            common_prefix_length: 0,
+            rest: Cow::Borrowed(&long[..]),
+        }];
+        positions.extend((0..10_000).map(|_| PositionDelta {
+            common_prefix_length: long.len(),
+            rest: Cow::Borrowed(&[][..]),
+        }));
+        let bytes = PositionArena { positions }.encode();
+        assert!(bytes.len() < long.len() + 64 * 1024, "{}", bytes.len());
+        let arena = PositionArena::decode(&bytes).unwrap();
+        assert!(arena.try_parse_to_positions(bytes.len()).is_err());
+
+        // The long position alone is its own input, and fits.
+        let bytes = PositionArena {
+            positions: vec![PositionDelta {
+                common_prefix_length: 0,
+                rest: Cow::Borrowed(&long[..]),
+            }],
+        }
+        .encode();
+        let arena = PositionArena::decode(&bytes).unwrap();
+        assert_eq!(arena.try_parse_to_positions(bytes.len()).unwrap()[0], long);
     }
 }
