@@ -105,6 +105,36 @@ fn refused_undo_keeps_its_item() {
     assert!(map.get("forbidden").is_none());
 }
 
+#[test]
+fn scope_api_checks_then_commits_or_undoes() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    guard(&doc);
+    let vv = doc.oplog_vv();
+    let scope = doc.begin_checked().unwrap();
+    assert!(doc.begin_checked().is_err());
+    doc.get_map("m").insert("forbidden", 1).unwrap();
+    assert!(!doc.check_checked(&scope, "app").unwrap());
+    doc.end_checked(scope, "app", false).unwrap();
+    assert_eq!(doc.oplog_vv(), vv);
+    assert_eq!(doc.get_pending_txn_len(), 0);
+
+    let scope = doc.begin_checked().unwrap();
+    doc.get_map("m").insert("ok", 1).unwrap();
+    assert!(doc.check_checked(&scope, "app").unwrap());
+    doc.end_checked(scope, "app", true).unwrap();
+    assert_eq!(doc.get_pending_txn_len(), 0);
+    assert!(doc.get_map("m").get("ok").is_some());
+
+    // A commit inside the scope breaks it: the ops stay.
+    let scope = doc.begin_checked().unwrap();
+    doc.get_map("m").insert("x", 2).unwrap();
+    doc.commit();
+    assert!(doc.check_checked(&scope, "app").is_err());
+    assert!(doc.end_checked(scope, "app", false).is_err());
+    assert!(doc.get_map("m").get("x").is_some());
+}
+
 /// Cost per commit, printed; run with `--nocapture`.
 #[test]
 fn cost_per_commit() {

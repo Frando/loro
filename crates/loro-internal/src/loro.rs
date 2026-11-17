@@ -2074,34 +2074,82 @@ impl LoroDoc {
         origin: &str,
         f: impl FnOnce() -> Result<T, E>,
     ) -> Result<Option<T>, E> {
+        let scope = self.begin_checked()?;
+        let out = f();
+        // A broken scope keeps its ops: `end_checked` reports it.
+        let keep = out.is_ok() && self.check_checked(&scope, origin).unwrap_or(true);
+        self.end_checked(scope, origin, keep)?;
+        out.map(|v| keep.then_some(v))
+    }
+
+    /// Opens a checked commit: the ops from here to [`Self::end_checked`] are one change.
+    ///
+    /// The scope API of [`Self::commit_checked`], for a caller that cannot wrap its
+    /// write in a closure. Pending ops from before are committed first, unchecked.
+    ///
+    /// # Errors
+    ///
+    /// [`LoroError::TransactionError`] when the doc cannot edit or a checked commit
+    /// already runs.
+    pub fn begin_checked(&self) -> LoroResult<crate::pre_commit::CheckedScope> {
+        let already = || LoroError::TransactionError("a checked commit already runs".into());
+        // The commit below would end a running scope.
+        if (self.txn.lock().as_ref()).is_some_and(|txn| txn.has_rollback_scope()) {
+            return Err(already());
+        }
         self.commit_then_renew();
         if !self.can_edit() {
-            return Err(LoroError::EditWhenDetached.into());
+            return Err(LoroError::EditWhenDetached);
         }
-        let scope = self
-            .begin_apply_diff_scope()
-            .ok_or_else(|| LoroError::TransactionError("a checked commit already runs".into()))?;
-        let out = f();
-        let intact = self
-            .txn
-            .lock()
-            .as_ref()
-            .is_some_and(|txn| txn.rollback_scope_is_intact(scope));
-        if !intact {
-            self.end_apply_diff_scope(scope);
-            return Err(LoroError::TransactionError(
-                "the checked ops were committed or mixed with another thread's".into(),
-            )
-            .into());
+        self.begin_apply_diff_scope()
+            .map(crate::pre_commit::CheckedScope)
+            .ok_or_else(already)
+    }
+
+    /// Returns whether the commit check passes the ops of `scope` so far.
+    ///
+    /// # Errors
+    ///
+    /// [`LoroError::TransactionError`] when its ops were committed or mixed with
+    /// another thread's.
+    pub fn check_checked(
+        &self,
+        scope: &crate::pre_commit::CheckedScope,
+        origin: &str,
+    ) -> LoroResult<bool> {
+        if !self.scope_is_intact(scope.0) {
+            return Err(broken_scope());
         }
-        let keep = out.is_ok() && self.check_scope(scope, origin);
-        if !keep {
-            self.rollback_apply_diff_scope(scope)?;
-            return out.map(|_| None);
+        Ok(self.check_scope(scope.0, origin))
+    }
+
+    /// Ends `scope`: commits its ops with `origin` if `commit`, unchecked, or undoes them.
+    ///
+    /// # Errors
+    ///
+    /// [`LoroError::TransactionError`] when its ops were committed or mixed with
+    /// another thread's: they then stay, pending.
+    pub fn end_checked(
+        &self,
+        scope: crate::pre_commit::CheckedScope,
+        origin: &str,
+        commit: bool,
+    ) -> LoroResult<()> {
+        if !self.scope_is_intact(scope.0) {
+            self.end_apply_diff_scope(scope.0);
+            return Err(broken_scope());
         }
-        self.end_apply_diff_scope(scope);
+        if !commit {
+            return self.rollback_apply_diff_scope(scope.0);
+        }
+        self.end_apply_diff_scope(scope.0);
         self.commit_with(CommitOptions::new().origin(origin).immediate_renew(true));
-        out.map(Some)
+        Ok(())
+    }
+
+    /// Whether rollback scope `scope` holds only its own ops, all pending.
+    fn scope_is_intact(&self, scope: u64) -> bool {
+        (self.txn.lock().as_ref()).is_some_and(|txn| txn.rollback_scope_is_intact(scope))
     }
 
     /// Undo the ops of a failed batch, keeping the ops the transaction held before it.
@@ -5589,4 +5637,11 @@ struct PlannedAlignment {
     edit: Option<crate::event::Diff>,
     /// Children kept by the alignment, whose own entries are full states too
     kept: FxHashSet<ContainerID>,
+}
+
+/// The error of a checked commit whose ops were committed or mixed with another thread's.
+fn broken_scope() -> LoroError {
+    LoroError::TransactionError(
+        "the checked ops were committed or mixed with another thread's".into(),
+    )
 }

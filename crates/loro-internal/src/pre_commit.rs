@@ -68,6 +68,11 @@ impl ChangeModifier {
     }
 }
 
+/// A checked commit opened with `LoroDoc::begin_checked`, ended with `LoroDoc::end_checked`.
+#[derive(Debug)]
+#[must_use = "a checked commit ends with `end_checked`"]
+pub struct CheckedScope(pub(crate) u64);
+
 /// The check a checked local commit must pass, set with `LoroDoc::set_commit_check`.
 ///
 /// Returns false to refuse the commit: its ops are undone and never become a

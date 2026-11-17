@@ -17,7 +17,7 @@ pub use loro_internal::encoding::{ImportBatchDetail, ImportBlobOutcome, ImportSt
 use loro_internal::handler::{HandlerTrait, ValueOrHandler};
 pub use loro_internal::loro::ChangeTravelError;
 pub use loro_internal::pre_commit::{
-    ChangeModifier, CommitCheck, CommitCheckFn, FirstCommitFromPeerCallback,
+    ChangeModifier, CheckedScope, CommitCheck, CommitCheckFn, FirstCommitFromPeerCallback,
     FirstCommitFromPeerPayload, PreCommitCallback, PreCommitCallbackPayload,
 };
 pub use loro_internal::sync;
@@ -2142,6 +2142,36 @@ impl LoroDoc {
         f: impl FnOnce() -> Result<T, E>,
     ) -> Result<Option<T>, E> {
         self.doc.commit_checked(origin, f)
+    }
+
+    /// Opens a checked commit: the ops from here to [`Self::end_checked`] are one change.
+    ///
+    /// The scope API of [`Self::commit_checked`], for a write that is not one closure.
+    ///
+    /// # Errors
+    ///
+    /// A [`LoroError`] when the doc is detached or a checked commit already runs.
+    pub fn begin_checked(&self) -> LoroResult<CheckedScope> {
+        self.doc.begin_checked()
+    }
+
+    /// Returns whether the commit check passes the ops of `scope` so far.
+    ///
+    /// # Errors
+    ///
+    /// A [`LoroError`] when its ops were committed or mixed with another thread's.
+    pub fn check_checked(&self, scope: &CheckedScope, origin: &str) -> LoroResult<bool> {
+        self.doc.check_checked(scope, origin)
+    }
+
+    /// Ends `scope`: commits its ops with `origin` if `commit`, unchecked, or undoes them.
+    ///
+    /// # Errors
+    ///
+    /// A [`LoroError`] when its ops were committed or mixed with another thread's: they
+    /// then stay, pending.
+    pub fn end_checked(&self, scope: CheckedScope, origin: &str, commit: bool) -> LoroResult<()> {
+        self.doc.end_checked(scope, origin, commit)
     }
 
     /// Subscribe to pre-commit events.
