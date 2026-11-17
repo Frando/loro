@@ -37,6 +37,8 @@ pub enum LoroError {
     NotFoundError(Box<str>),
     #[error("Transaction error ({0})")]
     TransactionError(Box<str>),
+    #[error("The commit check refused the commit")]
+    CommitRefused,
     #[error("Index out of bound. The given pos is {pos}, but the length is {len}. {info}")]
     OutOfBound {
         pos: usize,

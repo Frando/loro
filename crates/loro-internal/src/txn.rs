@@ -671,6 +671,38 @@ impl Transaction {
         self.rollback_scope.is_some()
     }
 
+    /// Runs `check` over the ops of the intact rollback scope `id`.
+    pub(crate) fn check_scope(
+        &self,
+        id: u64,
+        origin: &str,
+        check: &crate::pre_commit::CommitCheckFn,
+    ) -> bool {
+        assert!(self.rollback_scope_is_intact(id));
+        let scope = self.rollback_scope.as_ref().unwrap();
+        if scope.counter == self.next_counter {
+            return true;
+        }
+        let deps = if scope.counter == self.start_counter {
+            self.frontiers.clone()
+        } else {
+            Frontiers::from_id(ID::new(self.peer, scope.counter - 1))
+        };
+        check(&crate::pre_commit::CommitCheck {
+            origin,
+            change: crate::op_view::ChangeView {
+                id: ID::new(self.peer, scope.counter),
+                deps: &deps,
+                message: self.msg.as_deref(),
+                lamport: scope.lamport,
+                timestamp: self.latest_timestamp,
+            },
+            ops: &self.local_ops,
+            range: scope.counter..self.next_counter,
+            arena: &self.arena,
+        })
+    }
+
     pub(crate) fn end_rollback_scope(&mut self, id: u64) {
         if self.rollback_scope.as_ref().is_some_and(|s| s.id == id) {
             self.rollback_scope = None;

@@ -67,3 +67,40 @@ impl ChangeModifier {
         }
     }
 }
+
+/// The check a checked local commit must pass, set with `LoroDoc::set_commit_check`.
+///
+/// Returns false to refuse the commit: its ops are undone and never become a
+/// change. It runs while the doc's transaction lock is held, so it may read
+/// the doc (whose state already shows the ops) but not edit it.
+pub type CommitCheckFn = Arc<dyn Fn(&CommitCheck<'_>) -> bool + Send + Sync + 'static>;
+
+/// The pending ops of a checked local commit, given to a [`CommitCheckFn`].
+#[derive(Debug)]
+pub struct CommitCheck<'a> {
+    /// The origin of the commit (`"undo"` for an undo or redo).
+    pub origin: &'a str,
+    /// The change the ops would form: its first id, deps and Lamport time.
+    pub change: crate::op_view::ChangeView<'a>,
+    pub(crate) ops: &'a [crate::op::Op],
+    pub(crate) range: std::ops::Range<loro_common::Counter>,
+    pub(crate) arena: &'a crate::arena::SharedArena,
+}
+
+impl CommitCheck<'_> {
+    /// Calls `f` for every pending op, in counter order.
+    ///
+    /// Returns false if an op could not be read.
+    pub fn visit_ops(&self, f: &mut dyn FnMut(&crate::op_view::OpView<'_>)) -> bool {
+        let mut end = 0;
+        crate::op_view::visit_ops(
+            self.arena,
+            &self.change,
+            self.ops.iter(),
+            self.range.clone(),
+            &mut None,
+            &mut end,
+            &mut |_, op| f(op),
+        )
+    }
+}

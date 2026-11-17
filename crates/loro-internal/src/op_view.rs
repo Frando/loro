@@ -8,11 +8,13 @@
 
 use loro_common::{ContainerID, Counter, HasCounterSpan, IdLp, IdSpan, LoroValue, TreeID, ID};
 
+use crate::arena::SharedArena;
 use crate::container::idx::ContainerIdx;
 use crate::container::list::list_op::{DeleteSpanWithId, InnerListOp};
 use crate::container::map::MapSet;
 use crate::container::tree::tree_op::TreeOp;
 use crate::encoding::OwnedValue;
+use crate::op::Op;
 use crate::op::{FutureInnerContent, InnerContent};
 use crate::oplog::OpLog;
 use crate::version::Frontiers;
@@ -203,134 +205,155 @@ impl OpLog {
                 lamport: change.lamport,
                 timestamp: change.timestamp,
             };
-            for op in change.ops.iter() {
-                let len = rle::HasLength::atom_len(op);
-                if op.counter + len as Counter <= span.counter.start {
-                    continue;
-                }
-                if op.counter >= span.counter.end {
-                    break;
-                }
-                if cached.as_ref().is_none_or(|(i, _)| *i != op.container) {
-                    let Some(id) = self.arena.get_container_id(op.container) else {
-                        return end;
-                    };
-                    cached = Some((op.container, id));
-                }
-                let container = &cached.as_ref().unwrap().1;
-                let mut call = |content: OpContentView<'_>| {
-                    f(
-                        &cv,
-                        &OpView {
-                            counter: op.counter,
-                            len,
-                            container,
-                            content,
-                        },
-                    )
-                };
-                match &op.content {
-                    InnerContent::List(l) => match l {
-                        InnerListOp::InsertText { slice, pos, .. } => {
-                            let Ok(text) = std::str::from_utf8(slice.as_bytes()) else {
-                                return end;
-                            };
-                            call(OpContentView::TextInsert { pos: *pos, text });
-                        }
-                        InnerListOp::Insert { slice, pos } => call(OpContentView::ListInsert {
-                            pos: *pos as u32,
-                            values: slice.as_slice(),
-                        }),
-                        InnerListOp::Delete(DeleteSpanWithId { id_start, span }) => {
-                            call(OpContentView::Delete {
-                                pos: span.pos,
-                                signed_len: span.signed_len,
-                                start_id: *id_start,
-                            })
-                        }
-                        InnerListOp::Move { from, elem_id, to } => call(OpContentView::Move {
-                            from: *from,
-                            to: *to,
-                            elem: *elem_id,
-                        }),
-                        InnerListOp::Set { elem_id, value } => call(OpContentView::Set {
-                            elem: *elem_id,
-                            value,
-                        }),
-                        InnerListOp::StyleStart {
-                            start,
-                            end,
-                            key,
-                            value,
-                            info,
-                        } => call(OpContentView::Mark {
-                            start: *start,
-                            end: *end,
-                            key,
-                            value,
-                            info: info.to_byte(),
-                        }),
-                        InnerListOp::StyleEnd => call(OpContentView::MarkEnd),
-                    },
-                    InnerContent::Map(MapSet { key, value }) => call(OpContentView::MapSet {
-                        key,
-                        value: value.as_ref(),
-                    }),
-                    InnerContent::Tree(t) => match &**t {
-                        TreeOp::Create {
-                            target,
-                            parent,
-                            position,
-                        } => call(OpContentView::TreeCreate {
-                            target: *target,
-                            parent: *parent,
-                            position: position.as_bytes(),
-                        }),
-                        TreeOp::Move {
-                            target,
-                            parent,
-                            position,
-                        } => call(OpContentView::TreeMove {
-                            target: *target,
-                            parent: *parent,
-                            position: position.as_bytes(),
-                        }),
-                        TreeOp::Delete { target } => {
-                            call(OpContentView::TreeDelete { target: *target })
-                        }
-                    },
-                    InnerContent::Future(fc) => match fc {
-                        #[cfg(feature = "counter")]
-                        FutureInnerContent::Counter(x) => call(OpContentView::Counter(*x)),
-                        FutureInnerContent::Unknown { prop, value } => {
-                            let value = match &**value {
-                                OwnedValue::Null => UnknownValue::Value(LoroValue::Null),
-                                OwnedValue::True => UnknownValue::Value(LoroValue::Bool(true)),
-                                OwnedValue::False => UnknownValue::Value(LoroValue::Bool(false)),
-                                OwnedValue::I64(i) => UnknownValue::Value(LoroValue::I64(*i)),
-                                OwnedValue::F64(x) => UnknownValue::Value(LoroValue::Double(*x)),
-                                OwnedValue::Str(s) => {
-                                    UnknownValue::Value(LoroValue::from(s.as_str()))
-                                }
-                                OwnedValue::Binary(b) => {
-                                    UnknownValue::Value(LoroValue::from(b.to_vec()))
-                                }
-                                OwnedValue::LoroValue(v) => UnknownValue::Value(v.clone()),
-                                OwnedValue::Future(
-                                    crate::encoding::value::OwnedFutureValue::Unknown {
-                                        kind,
-                                        data,
-                                    },
-                                ) => UnknownValue::Future { kind: *kind, data },
-                                _ => UnknownValue::Internal,
-                            };
-                            call(OpContentView::Unknown { prop: *prop, value })
-                        }
-                    },
-                }
-                end = op.counter + len as Counter;
+            if !visit_ops(
+                &self.arena,
+                &cv,
+                change.ops.iter(),
+                span.counter.start..span.counter.end,
+                &mut cached,
+                &mut end,
+                f,
+            ) {
+                return end;
             }
         }
         end
     }
+}
+
+/// Calls `f` for every op of `ops` that overlaps `range`, and sets `end` to
+/// the counter after each op visited.
+///
+/// Returns false if an op could not be read (unknown container, text that
+/// is not UTF-8). Used for the ops of the oplog and of a pending
+/// transaction ([`crate::pre_commit::CommitCheck`]).
+pub(crate) fn visit_ops<'o>(
+    arena: &SharedArena,
+    cv: &ChangeView<'_>,
+    ops: impl Iterator<Item = &'o Op>,
+    range: std::ops::Range<Counter>,
+    cached: &mut Option<(ContainerIdx, ContainerID)>,
+    end: &mut Counter,
+    f: &mut dyn FnMut(&ChangeView<'_>, &OpView<'_>),
+) -> bool {
+    for op in ops {
+        let len = rle::HasLength::atom_len(op);
+        if op.counter + len as Counter <= range.start {
+            continue;
+        }
+        if op.counter >= range.end {
+            break;
+        }
+        if cached.as_ref().is_none_or(|(i, _)| *i != op.container) {
+            let Some(id) = arena.get_container_id(op.container) else {
+                return false;
+            };
+            *cached = Some((op.container, id));
+        }
+        let container = &cached.as_ref().unwrap().1;
+        let mut call = |content: OpContentView<'_>| {
+            f(
+                cv,
+                &OpView {
+                    counter: op.counter,
+                    len,
+                    container,
+                    content,
+                },
+            )
+        };
+        match &op.content {
+            InnerContent::List(l) => match l {
+                InnerListOp::InsertText { slice, pos, .. } => {
+                    let Ok(text) = std::str::from_utf8(slice.as_bytes()) else {
+                        return false;
+                    };
+                    call(OpContentView::TextInsert { pos: *pos, text });
+                }
+                InnerListOp::Insert { slice, pos } => call(OpContentView::ListInsert {
+                    pos: *pos as u32,
+                    values: slice.as_slice(),
+                }),
+                InnerListOp::Delete(DeleteSpanWithId { id_start, span }) => {
+                    call(OpContentView::Delete {
+                        pos: span.pos,
+                        signed_len: span.signed_len,
+                        start_id: *id_start,
+                    })
+                }
+                InnerListOp::Move { from, elem_id, to } => call(OpContentView::Move {
+                    from: *from,
+                    to: *to,
+                    elem: *elem_id,
+                }),
+                InnerListOp::Set { elem_id, value } => call(OpContentView::Set {
+                    elem: *elem_id,
+                    value,
+                }),
+                InnerListOp::StyleStart {
+                    start,
+                    end,
+                    key,
+                    value,
+                    info,
+                } => call(OpContentView::Mark {
+                    start: *start,
+                    end: *end,
+                    key,
+                    value,
+                    info: info.to_byte(),
+                }),
+                InnerListOp::StyleEnd => call(OpContentView::MarkEnd),
+            },
+            InnerContent::Map(MapSet { key, value }) => call(OpContentView::MapSet {
+                key,
+                value: value.as_ref(),
+            }),
+            InnerContent::Tree(t) => match &**t {
+                TreeOp::Create {
+                    target,
+                    parent,
+                    position,
+                } => call(OpContentView::TreeCreate {
+                    target: *target,
+                    parent: *parent,
+                    position: position.as_bytes(),
+                }),
+                TreeOp::Move {
+                    target,
+                    parent,
+                    position,
+                } => call(OpContentView::TreeMove {
+                    target: *target,
+                    parent: *parent,
+                    position: position.as_bytes(),
+                }),
+                TreeOp::Delete { target } => call(OpContentView::TreeDelete { target: *target }),
+            },
+            InnerContent::Future(fc) => match fc {
+                #[cfg(feature = "counter")]
+                FutureInnerContent::Counter(x) => call(OpContentView::Counter(*x)),
+                FutureInnerContent::Unknown { prop, value } => {
+                    let value = match &**value {
+                        OwnedValue::Null => UnknownValue::Value(LoroValue::Null),
+                        OwnedValue::True => UnknownValue::Value(LoroValue::Bool(true)),
+                        OwnedValue::False => UnknownValue::Value(LoroValue::Bool(false)),
+                        OwnedValue::I64(i) => UnknownValue::Value(LoroValue::I64(*i)),
+                        OwnedValue::F64(x) => UnknownValue::Value(LoroValue::Double(*x)),
+                        OwnedValue::Str(s) => UnknownValue::Value(LoroValue::from(s.as_str())),
+                        OwnedValue::Binary(b) => UnknownValue::Value(LoroValue::from(b.to_vec())),
+                        OwnedValue::LoroValue(v) => UnknownValue::Value(v.clone()),
+                        OwnedValue::Future(crate::encoding::value::OwnedFutureValue::Unknown {
+                            kind,
+                            data,
+                        }) => UnknownValue::Future { kind: *kind, data },
+                        _ => UnknownValue::Internal,
+                    };
+                    call(OpContentView::Unknown { prop: *prop, value })
+                }
+            },
+        }
+        *end = op.counter + len as Counter;
+    }
+    true
 }

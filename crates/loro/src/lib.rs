@@ -17,8 +17,8 @@ pub use loro_internal::encoding::{ImportBatchDetail, ImportBlobOutcome, ImportSt
 use loro_internal::handler::{HandlerTrait, ValueOrHandler};
 pub use loro_internal::loro::ChangeTravelError;
 pub use loro_internal::pre_commit::{
-    ChangeModifier, FirstCommitFromPeerCallback, FirstCommitFromPeerPayload, PreCommitCallback,
-    PreCommitCallbackPayload,
+    ChangeModifier, CommitCheck, CommitCheckFn, FirstCommitFromPeerCallback,
+    FirstCommitFromPeerPayload, PreCommitCallback, PreCommitCallbackPayload,
 };
 pub use loro_internal::sync;
 pub use loro_internal::undo::{OnPop, UndoItemMeta, UndoOrRedo};
@@ -2115,6 +2115,33 @@ impl LoroDoc {
         callback: FirstCommitFromPeerCallback,
     ) -> Subscription {
         self.doc.subscribe_first_commit_from_peer(callback)
+    }
+
+    /// Sets the check that [`Self::commit_checked`], undo and redo run before their
+    /// ops become a change, or removes it with `None`.
+    ///
+    /// A check that returns false refuses the commit: its ops are undone and never
+    /// become a change. A refused undo or redo fails with
+    /// [`LoroError::CommitRefused`] and keeps its item. Plain commits are not checked.
+    pub fn set_commit_check(&self, check: Option<CommitCheckFn>) {
+        self.doc.set_commit_check(check);
+    }
+
+    /// Runs `f` and commits its ops with `origin` if `f` returns `Ok` and the commit
+    /// check passes; otherwise its ops are undone and become no change.
+    ///
+    /// Returns `Ok(None)` when the check refused.
+    ///
+    /// # Errors
+    ///
+    /// The error of `f`, or a [`LoroError`] when no checked commit can run (the doc
+    /// is detached, a checked commit already runs, or `f` committed).
+    pub fn commit_checked<T, E: From<LoroError>>(
+        &self,
+        origin: &str,
+        f: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        self.doc.commit_checked(origin, f)
     }
 
     /// Subscribe to pre-commit events.

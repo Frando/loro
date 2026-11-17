@@ -172,6 +172,8 @@ pub struct LoroDocInner {
     first_commit_from_peer_subs:
         SubscriberSetWithQueue<(), FirstCommitFromPeerCallback, FirstCommitFromPeerPayload>,
     pre_commit_subs: SubscriberSetWithQueue<(), PreCommitCallback, PreCommitCallbackPayload>,
+    /// See [`LoroDoc::set_commit_check`].
+    commit_check: crate::sync::Mutex<Option<pre_commit::CommitCheckFn>>,
 }
 
 /// The version of the loro crate

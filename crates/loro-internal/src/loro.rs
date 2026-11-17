@@ -196,6 +196,7 @@ impl LoroDoc {
                 local_update_subs: SubscriberSetWithQueue::new(),
                 peer_id_change_subs: SubscriberSetWithQueue::new(),
                 pre_commit_subs: SubscriberSetWithQueue::new(),
+                commit_check: crate::sync::Mutex::new(None),
                 first_commit_from_peer_subs: SubscriberSetWithQueue::new(),
             }
         });
@@ -1795,6 +1796,13 @@ impl LoroDoc {
                 Ok(())
             }
         });
+        // The commit check sees the undo's ops while they can still be rolled back.
+        let applied = applied.and_then(|()| match undo_scope {
+            Some(scope) if rejected.is_none() && !self.check_scope(scope, "undo") => {
+                Err(LoroError::CommitRefused)
+            }
+            _ => Ok(()),
+        });
         if let Some(scope) = undo_scope {
             self.finish_undo_rollback(scope, applied.is_ok());
         }
@@ -2026,6 +2034,74 @@ impl LoroDoc {
             txn.end_rollback_scope(scope);
         }
         self.state.lock().end_local_rollback(scope);
+    }
+
+    /// Sets the check that [`Self::commit_checked`], undo and redo run before their ops
+    /// become a change, or removes it with `None`.
+    ///
+    /// Other commits (plain edits, an implicit commit by an import or export) are not
+    /// checked: a caller that must check every local change writes through
+    /// [`Self::commit_checked`] only.
+    pub fn set_commit_check(&self, check: Option<crate::pre_commit::CommitCheckFn>) {
+        *self.commit_check.lock() = check;
+    }
+
+    /// Whether the commit check passes the ops of rollback scope `scope`, which is
+    /// intact. Holds the transaction lock while the check runs.
+    fn check_scope(&self, scope: u64, origin: &str) -> bool {
+        let Some(check) = self.commit_check.lock().clone() else {
+            return true;
+        };
+        let guard = self.txn.lock();
+        let txn = guard.as_ref().expect("an intact scope has its transaction");
+        txn.check_scope(scope, origin, &check)
+    }
+
+    /// Runs `f`, then commits its ops with `origin` if `f` returns `Ok` and the commit
+    /// check ([`Self::set_commit_check`]) passes them.
+    ///
+    /// Otherwise its ops are undone and become no change: the state, the version and
+    /// the next op id are as before `f`. Pending ops from before are committed first,
+    /// unchecked. Returns `Ok(None)` when the check refused.
+    ///
+    /// # Errors
+    ///
+    /// The error of `f`, or [`LoroError::TransactionError`] when the doc cannot edit,
+    /// a checked commit already runs, or `f` committed or another thread wrote while
+    /// it ran (then nothing could be undone and the ops stay pending).
+    pub fn commit_checked<T, E: From<LoroError>>(
+        &self,
+        origin: &str,
+        f: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        self.commit_then_renew();
+        if !self.can_edit() {
+            return Err(LoroError::EditWhenDetached.into());
+        }
+        let scope = self
+            .begin_apply_diff_scope()
+            .ok_or_else(|| LoroError::TransactionError("a checked commit already runs".into()))?;
+        let out = f();
+        let intact = self
+            .txn
+            .lock()
+            .as_ref()
+            .is_some_and(|txn| txn.rollback_scope_is_intact(scope));
+        if !intact {
+            self.end_apply_diff_scope(scope);
+            return Err(LoroError::TransactionError(
+                "the checked ops were committed or mixed with another thread's".into(),
+            )
+            .into());
+        }
+        let keep = out.is_ok() && self.check_scope(scope, origin);
+        if !keep {
+            self.rollback_apply_diff_scope(scope)?;
+            return out.map(|_| None);
+        }
+        self.end_apply_diff_scope(scope);
+        self.commit_with(CommitOptions::new().origin(origin).immediate_renew(true));
+        out.map(Some)
     }
 
     /// Undo the ops of a failed batch, keeping the ops the transaction held before it.
