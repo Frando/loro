@@ -671,6 +671,11 @@ impl Transaction {
         self.rollback_scope.is_some()
     }
 
+    /// Whether a rollback scope that another thread opened runs in this txn.
+    pub(crate) fn has_foreign_rollback_scope(&self) -> bool {
+        (self.rollback_scope.as_ref()).is_some_and(|s| s.thread != current_thread_mark())
+    }
+
     /// Runs `check` over the ops of the intact rollback scope `id`.
     pub(crate) fn check_scope(
         &self,

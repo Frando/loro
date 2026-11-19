@@ -135,6 +135,74 @@ fn scope_api_checks_then_commits_or_undoes() {
     assert!(doc.get_map("m").get("x").is_some());
 }
 
+/// Another thread that commits while a scope is checked breaks the scope; the
+/// check then reports it instead of panicking on the missing transaction.
+#[test]
+fn scope_check_races_a_commit_of_another_thread() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    guard(&doc);
+    let stop = Arc::new(AtomicBool::new(false));
+    let other = {
+        let (doc, stop) = (doc.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                doc.get_map("other").insert("k", i).unwrap();
+                doc.commit();
+                i += 1;
+            }
+        })
+    };
+    let (mut kept, mut broken) = (0, 0);
+    for i in 0..20_000 {
+        let Ok(scope) = doc.begin_checked() else {
+            continue;
+        };
+        doc.get_map("m").insert("ok", i).unwrap();
+        match doc.check_checked(&scope, "app") {
+            Ok(pass) => {
+                assert!(pass);
+                kept += 1;
+            }
+            Err(_) => broken += 1,
+        }
+        let _ = doc.end_checked(scope, "app", true);
+    }
+    stop.store(true, Ordering::Relaxed);
+    other.join().unwrap();
+    assert!(kept + broken > 0);
+}
+
+/// An export of another thread commits implicitly. It waits for a running
+/// checked commit, so the check sees every op and a refusal undoes them.
+#[test]
+fn export_of_another_thread_waits_for_the_scope() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    guard(&doc);
+    let stop = Arc::new(AtomicBool::new(false));
+    let other = {
+        let (doc, stop) = (doc.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                doc.export(ExportMode::all_updates()).unwrap();
+            }
+        })
+    };
+    for i in 0..1_000 {
+        let scope = doc.begin_checked().unwrap();
+        let key = if i % 2 == 0 { "ok" } else { "forbidden" };
+        doc.get_map("m").insert(key, i).unwrap();
+        let pass = doc.check_checked(&scope, "app").unwrap();
+        assert_eq!(pass, i % 2 == 0);
+        doc.end_checked(scope, "app", pass).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    other.join().unwrap();
+    assert!(doc.get_map("m").get("forbidden").is_none());
+}
+
 /// Cost per commit, printed; run with `--nocapture`.
 #[test]
 fn cost_per_commit() {
