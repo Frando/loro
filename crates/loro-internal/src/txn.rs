@@ -227,8 +227,8 @@ pub struct Transaction {
 struct RollbackScope {
     id: u64,
     thread: usize,
-    /// Another thread applied an op in this txn while the batch ran.
-    foreign_ops: bool,
+    /// The txn's next counter when the scope's ops were last checked.
+    checked: Option<Counter>,
     /// The txn's next counter and lamport when the batch began.
     counter: Counter,
     lamport: Lamport,
@@ -244,6 +244,11 @@ struct RollbackScope {
 fn current_thread_mark() -> usize {
     thread_local!(static MARK: u8 = const { 0 });
     MARK.with(|m| m as *const u8 as usize)
+}
+
+/// The error of a write of another thread while a rollback scope runs.
+pub(crate) fn foreign_scope_error() -> LoroError {
+    LoroError::TransactionError("another thread's checked commit runs in this doc".into())
 }
 
 /// What [`Transaction::roll_back_scope`] took out of a txn.
@@ -659,7 +664,7 @@ impl Transaction {
         self.rollback_scope = Some(RollbackScope {
             id,
             thread: current_thread_mark(),
-            foreign_ops: false,
+            checked: None,
             counter: self.next_counter,
             lamport: self.next_lamport,
             is_peer_first_appearance: self.is_peer_first_appearance,
@@ -714,12 +719,25 @@ impl Transaction {
         }
     }
 
-    /// Whether this is the txn scope `id` began in and every op in it came from
-    /// the thread that began it.
+    /// Whether this is the txn scope `id` began in. Ops of other threads never
+    /// join a scope ([`Self::apply_local_op`] refuses them).
     pub(crate) fn rollback_scope_is_intact(&self, id: u64) -> bool {
-        self.rollback_scope
-            .as_ref()
-            .is_some_and(|s| s.id == id && !s.foreign_ops)
+        self.rollback_scope.as_ref().is_some_and(|s| s.id == id)
+    }
+
+    /// Records that the ops of scope `id` were checked up to here.
+    pub(crate) fn mark_scope_checked(&mut self, id: u64) {
+        let next = self.next_counter;
+        if let Some(scope) = self.rollback_scope.as_mut().filter(|s| s.id == id) {
+            scope.checked = Some(next);
+        }
+    }
+
+    /// Whether scope `id` gained no op since its last check (true if never checked).
+    pub(crate) fn scope_unchanged_since_check(&self, id: u64) -> bool {
+        (self.rollback_scope.as_ref())
+            .filter(|s| s.id == id)
+            .is_some_and(|s| s.checked.is_none_or(|c| c == self.next_counter))
     }
 
     /// Take the ops of scope `id` (which must be intact) out of the txn: it
@@ -813,10 +831,10 @@ impl Transaction {
             return Err(LoroError::UnmatchedContext { expected, found });
         }
 
-        if let Some(scope) = &mut self.rollback_scope {
-            if scope.thread != current_thread_mark() {
-                scope.foreign_ops = true;
-            }
+        // No op of another thread joins a rollback scope: it would be committed
+        // with the scope's ops, unchecked, or rolled back with them.
+        if self.has_foreign_rollback_scope() {
+            return Err(foreign_scope_error());
         }
 
         let len = content.content_len();

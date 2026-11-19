@@ -125,8 +125,19 @@ fn scope_api_checks_then_commits_or_undoes() {
     doc.end_checked(scope, "app", true).unwrap();
     assert_eq!(doc.get_pending_txn_len(), 0);
     assert!(doc.get_map("m").get("ok").is_some());
+}
 
-    // A commit inside the scope breaks it: the ops stay.
+/// A commit inside the scope, on its own thread, is a bug: debug builds panic;
+/// otherwise it breaks the scope, which then fails and its ops stay.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "a commit inside a rollback scope")
+)]
+fn a_commit_inside_the_scope_breaks_it() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    guard(&doc);
     let scope = doc.begin_checked().unwrap();
     doc.get_map("m").insert("x", 2).unwrap();
     doc.commit();
@@ -135,8 +146,9 @@ fn scope_api_checks_then_commits_or_undoes() {
     assert!(doc.get_map("m").get("x").is_some());
 }
 
-/// Another thread that commits while a scope is checked breaks the scope; the
-/// check then reports it instead of panicking on the missing transaction.
+/// Another thread that writes and commits while scopes run: its ops never join
+/// a scope, so every scope stays intact, every refusal undoes all its ops, and
+/// no refused op is ever committed.
 #[test]
 fn scope_check_races_a_commit_of_another_thread() {
     let doc = LoroDoc::new();
@@ -152,26 +164,117 @@ fn scope_check_races_a_commit_of_another_thread() {
                 doc.commit();
                 i += 1;
             }
+            i
         })
     };
-    let (mut kept, mut broken) = (0, 0);
-    for i in 0..20_000 {
-        let Ok(scope) = doc.begin_checked() else {
-            continue;
-        };
-        doc.get_map("m").insert("ok", i).unwrap();
-        match doc.check_checked(&scope, "app") {
-            Ok(pass) => {
-                assert!(pass);
-                kept += 1;
-            }
-            Err(_) => broken += 1,
-        }
-        let _ = doc.end_checked(scope, "app", true);
+    for i in 0..5_000 {
+        let scope = doc.begin_checked().unwrap();
+        let key = if i % 2 == 0 { "ok" } else { "forbidden" };
+        doc.get_map("m").insert(key, i).unwrap();
+        let pass = doc.check_checked(&scope, "app").unwrap();
+        assert_eq!(pass, i % 2 == 0);
+        doc.end_checked(scope, "app", pass).unwrap();
     }
     stop.store(true, Ordering::Relaxed);
-    other.join().unwrap();
-    assert!(kept + broken > 0);
+    assert!(other.join().unwrap() > 0);
+    doc.commit();
+    let peer = LoroDoc::new();
+    peer.import(&doc.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    assert!(peer.get_map("m").get("forbidden").is_none());
+    assert!(peer.get_map("m").get("ok").is_some());
+}
+
+/// A scope held longer than any wait: an update export of another thread
+/// exports the committed ops only, a snapshot export and a commit wait for the
+/// scope's end, a write fails after 5 s. The refused op never lands.
+#[test]
+fn a_long_scope_is_never_committed_by_another_thread() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    doc.get_map("m").insert("before", 1).unwrap();
+    doc.commit();
+    guard(&doc);
+    let scope = doc.begin_checked().unwrap();
+    doc.get_map("m").insert("forbidden", 1).unwrap();
+    let held = std::time::Duration::from_secs(6);
+    let start = Instant::now();
+    let spawn = |f: fn(&LoroDoc) -> Vec<u8>| {
+        let doc = doc.clone();
+        std::thread::spawn(move || (f(&doc), start.elapsed()))
+    };
+    let updates = spawn(|d| d.export(ExportMode::all_updates()).unwrap());
+    let snapshot = spawn(|d| d.export(ExportMode::Snapshot).unwrap());
+    let commit = spawn(|d| {
+        d.commit();
+        Vec::new()
+    });
+    let write = {
+        let doc = doc.clone();
+        std::thread::spawn(move || (doc.get_map("m").insert("other", 1), start.elapsed()))
+    };
+    // The update export does not wait, and has no op of the scope.
+    let (bytes, took) = updates.join().unwrap();
+    assert!(took < held, "{took:?}");
+    let peer = LoroDoc::new();
+    peer.import(&bytes).unwrap();
+    assert!(peer.get_map("m").get("before").is_some());
+    assert!(peer.get_map("m").get("forbidden").is_none());
+    // The write waits 5 s, then fails, and joins no scope.
+    let (out, took) = write.join().unwrap();
+    assert!(out.is_err() && took >= std::time::Duration::from_secs(5));
+    while start.elapsed() < held {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!doc.check_checked(&scope, "app").unwrap());
+    doc.end_checked(scope, "app", false).unwrap();
+    // The snapshot export and the commit waited for the end.
+    for t in [snapshot, commit] {
+        let (_, took) = t.join().unwrap();
+        assert!(took >= held, "{took:?}");
+    }
+    let snap = LoroDoc::new();
+    snap.import(&doc.export(ExportMode::Snapshot).unwrap())
+        .unwrap();
+    assert!(snap.get_map("m").get("forbidden").is_none());
+    assert!(doc.get_map("m").get("forbidden").is_none());
+    assert!(doc.get_map("m").get("other").is_none());
+}
+
+/// A panic in the closure of `commit_checked` undoes its ops; the doc goes on.
+#[test]
+fn panic_in_commit_checked_undoes_its_ops() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    let vv = doc.oplog_vv();
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = doc.commit_checked("app", || -> Result<(), LoroError> {
+            doc.get_map("m").insert("x", 1)?;
+            panic!("boom");
+        });
+    }));
+    assert!(out.is_err());
+    assert_eq!(doc.oplog_vv(), vv);
+    assert_eq!(doc.get_pending_txn_len(), 0);
+    let scope = doc.begin_checked().unwrap();
+    doc.end_checked(scope, "app", true).unwrap();
+}
+
+/// Ops added after the check are not committed with the checked ones.
+#[test]
+fn ops_after_the_check_refuse_the_commit() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    guard(&doc);
+    let vv = doc.oplog_vv();
+    let scope = doc.begin_checked().unwrap();
+    doc.get_map("m").insert("ok", 1).unwrap();
+    assert!(doc.check_checked(&scope, "app").unwrap());
+    doc.get_map("m").insert("forbidden", 1).unwrap();
+    assert!(doc.end_checked(scope, "app", true).is_err());
+    assert_eq!(doc.oplog_vv(), vv);
+    assert!(doc.get_map("m").get("forbidden").is_none());
+    assert_eq!(doc.get_pending_txn_len(), 0);
 }
 
 /// An export of another thread commits implicitly. It waits for a running

@@ -5071,8 +5071,9 @@ impl MapHandler {
 }
 
 fn with_txn<R>(doc: &LoroDoc, f: impl FnOnce(&mut Transaction) -> LoroResult<R>) -> LoroResult<R> {
-    let txn = &doc.txn;
-    let mut txn = txn.lock();
+    // A write of another thread waits for a running checked commit; after the
+    // wait the op is refused (`Transaction::apply_local_op`), it never joins it.
+    let (mut txn, _) = crate::loro::wait_for_foreign_scope(&doc.txn);
     loop {
         if let Some(txn) = &mut *txn {
             return f(txn);

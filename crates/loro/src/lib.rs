@@ -2159,17 +2159,20 @@ impl LoroDoc {
     ///
     /// # Errors
     ///
-    /// A [`LoroError`] when its ops were committed or mixed with another thread's.
+    /// A [`LoroError`] when its ops were committed by an implicit commit of this thread.
     pub fn check_checked(&self, scope: &CheckedScope, origin: &str) -> LoroResult<bool> {
         self.doc.check_checked(scope, origin)
     }
 
-    /// Ends `scope`: commits its ops with `origin` if `commit`, unchecked, or undoes them.
+    /// Ends `scope`: commits its ops with `origin` if `commit`, or undoes them.
+    ///
+    /// A scope never checked commits unchecked.
     ///
     /// # Errors
     ///
-    /// A [`LoroError`] when its ops were committed or mixed with another thread's: they
-    /// then stay, pending.
+    /// A [`LoroError`] when its ops were committed (by an implicit commit of this
+    /// thread), or, to commit, when it gained ops since [`Self::check_checked`]:
+    /// nothing is committed then.
     pub fn end_checked(&self, scope: CheckedScope, origin: &str, commit: bool) -> LoroResult<()> {
         self.doc.end_checked(scope, origin, commit)
     }

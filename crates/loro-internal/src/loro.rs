@@ -385,8 +385,30 @@ impl LoroDoc {
         Option<CommitOptions>,
         Option<LoroMutexGuard<'_, Option<Transaction>>>,
     ) {
+        self.commit_ending_scope(config, preserve_on_empty, None)
+            .expect("a commit that ends no scope does not fail")
+    }
+
+    /// [`Self::commit_internal`], which with `end_scope` first ends that rollback
+    /// scope under the same transaction guard as the commit, so no other thread
+    /// commits or writes between the end and the commit.
+    ///
+    /// # Errors
+    ///
+    /// When `end_scope` is no longer intact or gained ops since its last check:
+    /// nothing is committed then.
+    #[allow(clippy::type_complexity)]
+    fn commit_ending_scope(
+        &self,
+        config: CommitOptions,
+        preserve_on_empty: bool,
+        end_scope: Option<u64>,
+    ) -> LoroResult<(
+        Option<CommitOptions>,
+        Option<LoroMutexGuard<'_, Option<Transaction>>>,
+    )> {
         let mut panic = DeferredPanic::default();
-        let ans = self.commit_internal_inner(config, preserve_on_empty, &mut panic);
+        let ans = self.commit_internal_inner(config, preserve_on_empty, end_scope, &mut panic);
         if !panic.has_panic() {
             return ans;
         }
@@ -395,37 +417,65 @@ impl LoroDoc {
         unreachable!("resume raises the deferred panic")
     }
 
+    #[allow(clippy::type_complexity)]
     fn commit_internal_inner(
         &self,
         config: CommitOptions,
         preserve_on_empty: bool,
+        mut end_scope: Option<u64>,
         panic: &mut DeferredPanic,
-    ) -> (
+    ) -> LoroResult<(
         Option<CommitOptions>,
         Option<LoroMutexGuard<'_, Option<Transaction>>>,
-    ) {
+    )> {
         if !self.auto_commit.load(Acquire) {
             let txn_guard = self.txn.lock();
+            if end_scope.is_some() {
+                return Err(broken_scope());
+            }
             // if not auto_commit, nothing should happen
             // because the global txn is not used
-            return (None, Some(txn_guard));
+            return Ok((None, Some(txn_guard)));
         }
 
         let mut since = None;
         loop {
             if let Some(txn_guard) = self.before_commit() {
-                return (None, Some(txn_guard));
+                if end_scope.is_some() {
+                    return Err(broken_scope());
+                }
+                return Ok((None, Some(txn_guard)));
             }
 
             let mut txn_guard = self.txn.lock();
-            if let Some(pause) = scope_wait(&txn_guard, &mut since) {
+            // The commit that ends a scope never waits: the scope is its own.
+            let wait = end_scope
+                .is_none()
+                .then(|| scope_wait(&txn_guard, &mut since));
+            if let Some(pause) = wait.flatten() {
                 drop(txn_guard);
                 std::thread::sleep(pause);
                 continue;
             }
+            if let Some(id) = end_scope.take() {
+                let Some(txn) = txn_guard.as_mut() else {
+                    return Err(broken_scope());
+                };
+                if !txn.rollback_scope_is_intact(id) || !txn.scope_unchanged_since_check(id) {
+                    return Err(broken_scope());
+                }
+                txn.end_rollback_scope(id);
+                self.state.lock().end_local_rollback(id);
+            }
+            // An implicit commit (an export, a checkout, `get_cursor_pos`, ...) on the
+            // thread of a running checked commit would commit its ops unchecked.
+            debug_assert!(
+                !txn_guard.as_ref().is_some_and(|t| t.has_rollback_scope()),
+                "a commit inside a rollback scope of this thread"
+            );
             let txn = txn_guard.take();
             let Some(mut txn) = txn else {
-                return (None, Some(txn_guard));
+                return Ok((None, Some(txn_guard)));
             };
             let on_commit = txn.take_on_commit();
             if let Some(origin) = config.origin.clone() {
@@ -467,14 +517,14 @@ impl LoroDoc {
                 }
             }
 
-            return (
+            return Ok((
                 options,
                 if !config.immediate_renew {
                     Some(txn_guard)
                 } else {
                     None
                 },
-            );
+            ));
         }
     }
 
@@ -2012,7 +2062,9 @@ impl LoroDoc {
     /// to run it in (the batch then fails before it applies anything) or another thread's
     /// batch runs in it.
     fn begin_apply_diff_scope(&self) -> Option<u64> {
-        let mut guard = self.txn.lock();
+        // Another thread's scope: wait for it. If it still runs, the batch's ops
+        // are refused (`Transaction::apply_local_op`) and nothing is applied.
+        let (mut guard, _) = wait_for_foreign_scope(&self.txn);
         if guard.is_none() && !cfg!(target_arch = "wasm32") && self.can_edit() {
             // Like the handlers' `with_txn`, which the batch's first op would call.
             // Under the same guard: an export of another thread between a
@@ -2059,10 +2111,11 @@ impl LoroDoc {
     /// cannot take the transaction in between.
     fn check_scope(&self, scope: u64, origin: &str) -> Option<bool> {
         let check = self.commit_check.lock().clone();
-        let guard = self.txn.lock();
+        let mut guard = self.txn.lock();
         let txn = guard
-            .as_ref()
+            .as_mut()
             .filter(|txn| txn.rollback_scope_is_intact(scope))?;
+        txn.mark_scope_checked(scope);
         Some(check.is_none_or(|check| txn.check_scope(scope, origin, &check)))
     }
 
@@ -2073,8 +2126,10 @@ impl LoroDoc {
     /// the next op id are as before `f`. Pending ops from before are committed first,
     /// unchecked. Returns `Ok(None)` when the check refused.
     ///
-    /// A commit of another thread, also the implicit one of an export or import,
-    /// waits until the checked commit ends (up to 5 seconds).
+    /// A commit of another thread, also the implicit one of an import or a snapshot
+    /// export, waits until the checked commit ends; an update export exports the
+    /// committed ops only. A write of another thread waits up to 5 seconds, then
+    /// fails. If `f` panics, its ops are undone.
     ///
     /// # Errors
     ///
@@ -2086,10 +2141,20 @@ impl LoroDoc {
         origin: &str,
         f: impl FnOnce() -> Result<T, E>,
     ) -> Result<Option<T>, E> {
-        let scope = self.begin_checked()?;
+        /// Undoes the scope's ops if `f` panics.
+        struct Guard<'a>(&'a LoroDoc, Option<crate::pre_commit::CheckedScope>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if let Some(scope) = self.1.take() {
+                    let _ = self.0.end_checked(scope, "", false);
+                }
+            }
+        }
+        let mut guard = Guard(self, Some(self.begin_checked()?));
         let out = f();
-        // A broken scope keeps its ops: `end_checked` reports it.
-        let keep = out.is_ok() && self.check_checked(&scope, origin).unwrap_or(true);
+        let scope = guard.1.take().expect("taken only here");
+        // A broken scope is never kept: `end_checked` reports it.
+        let keep = out.is_ok() && self.check_checked(&scope, origin).unwrap_or(false);
         self.end_checked(scope, origin, keep)?;
         out.map(|v| keep.then_some(v))
     }
@@ -2129,31 +2194,56 @@ impl LoroDoc {
         scope: &crate::pre_commit::CheckedScope,
         origin: &str,
     ) -> LoroResult<bool> {
+        self.debug_assert_scope_thread(scope);
         self.check_scope(scope.0, origin).ok_or_else(broken_scope)
     }
 
-    /// Ends `scope`: commits its ops with `origin` if `commit`, unchecked, or undoes them.
+    /// A scope's ops are told from others' by the OS thread: a scope that
+    /// moved to another thread (an `.await` inside it) would refuse its own ops.
+    fn debug_assert_scope_thread(&self, _scope: &crate::pre_commit::CheckedScope) {
+        #[cfg(debug_assertions)]
+        if let Some(txn) = self.txn.lock().as_ref() {
+            debug_assert!(
+                !(txn.has_foreign_rollback_scope() && txn.rollback_scope_is_intact(_scope.0)),
+                "a checked commit continued on another thread than it began on"
+            );
+        }
+    }
+
+    /// Ends `scope`: commits its ops with `origin` if `commit`, or undoes them.
+    ///
+    /// The commit runs under the guard that ends the scope, so no other thread
+    /// commits or writes in between. A scope never checked commits unchecked.
     ///
     /// # Errors
     ///
-    /// [`LoroError::TransactionError`] when its ops were committed or mixed with
-    /// another thread's: they then stay, pending.
+    /// [`LoroError::TransactionError`] when its ops were committed (by an implicit
+    /// commit of this thread), or, to commit, when it gained ops since
+    /// [`Self::check_checked`]. Nothing is committed then; the ops of a scope that
+    /// is still intact are undone.
     pub fn end_checked(
         &self,
         scope: crate::pre_commit::CheckedScope,
         origin: &str,
         commit: bool,
     ) -> LoroResult<()> {
+        self.debug_assert_scope_thread(&scope);
         if !self.scope_is_intact(scope.0) {
             self.end_apply_diff_scope(scope.0);
             return Err(broken_scope());
         }
-        if !commit {
-            return self.rollback_apply_diff_scope(scope.0);
+        if commit {
+            let options = CommitOptions::new().origin(origin).immediate_renew(true);
+            match self.commit_ending_scope(options, false, Some(scope.0)) {
+                Ok(_) => return Ok(()),
+                // Grown since the check: undo, as a refusal does.
+                Err(err) => {
+                    self.rollback_apply_diff_scope(scope.0)?;
+                    return Err(err);
+                }
+            }
         }
-        self.end_apply_diff_scope(scope.0);
-        self.commit_with(CommitOptions::new().origin(origin).immediate_renew(true));
-        Ok(())
+        self.rollback_apply_diff_scope(scope.0)
     }
 
     /// Whether rollback scope `scope` holds only its own ops, all pending.
@@ -4087,7 +4177,11 @@ impl LoroDoc {
         mode: ExportMode,
         reject_partial_history: bool,
     ) -> Result<Vec<u8>, LoroEncodeError> {
-        self.with_barrier(|| {
+        let updates = matches!(
+            mode,
+            ExportMode::Updates { .. } | ExportMode::UpdatesInRange { .. }
+        );
+        let run = || {
             if reject_partial_history {
                 self.oplog.lock().check_history_parsable()?;
             }
@@ -4108,7 +4202,14 @@ impl LoroDoc {
                 self.oplog.lock().check_history_parsable()?;
             }
             Ok(ans)
-        })
+        };
+        // An update export reads the op log only, so it needs no commit: while a
+        // rollback scope runs, of this thread or another, it exports the committed
+        // ops and leaves the scope's ops pending, checked when the scope ends.
+        if updates && (self.txn.lock().as_ref()).is_some_and(|t| t.has_rollback_scope()) {
+            return run();
+        }
+        self.with_barrier(run)
     }
 
     /// Export received remote changes waiting for causal dependencies, excluding
@@ -5648,19 +5749,20 @@ struct PlannedAlignment {
     kept: FxHashSet<ContainerID>,
 }
 
-/// How long a commit of another thread waits for a running rollback scope (a
-/// checked commit, an `apply_diff` or an undo) to end before it commits the
-/// scope's ops with its own, which breaks the scope.
-const SCOPE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a write of another thread waits for a running rollback scope (a
+/// checked commit, an `apply_diff` or an undo) before it fails; a commit of
+/// another thread logs a warning after each such span and goes on waiting.
+pub(crate) const SCOPE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The pause before the next look at the transaction, or `None` to commit now.
 ///
-/// A commit, also the implicit one of an export or import, takes the whole
-/// pending transaction. While another thread's rollback scope runs in it, that
-/// would commit the scope's ops unchecked and leave the scope without its
-/// transaction, so the commit waits for the scope to end, up to [`SCOPE_WAIT`]
-/// (a scope that is never ended must not stop the doc). The scope's own thread
-/// never waits.
+/// A commit, also the implicit one of an import, a snapshot export or a
+/// checkout, takes the whole pending transaction. While another thread's
+/// rollback scope runs in it, that would commit the scope's ops unchecked, so
+/// the commit waits for the scope to end, however long that takes: a scope is
+/// ended by the code that began it (`commit_checked` also on a panic). An
+/// update export does not wait: it exports the committed ops only. The scope's
+/// own thread never waits.
 fn scope_wait(
     txn: &Option<Transaction>,
     since: &mut Option<std::time::Instant>,
@@ -5669,13 +5771,46 @@ fn scope_wait(
     {
         return None;
     }
-    let waited = since.get_or_insert_with(std::time::Instant::now).elapsed();
-    (waited < SCOPE_WAIT).then(|| {
-        (waited / 4).clamp(
+    let start = since.get_or_insert_with(std::time::Instant::now);
+    let waited = start.elapsed();
+    if waited >= SCOPE_WAIT {
+        warn!(
+            "a commit waits for a checked commit of another thread ({} s)",
+            SCOPE_WAIT.as_secs()
+        );
+        *start = std::time::Instant::now();
+    }
+    Some((waited / 4).clamp(
+        std::time::Duration::from_micros(50),
+        std::time::Duration::from_millis(1),
+    ))
+}
+
+/// Waits while a rollback scope of another thread runs in `txn`, up to
+/// [`SCOPE_WAIT`]. Returns the guard, and whether such a scope still runs.
+pub(crate) fn wait_for_foreign_scope<'a>(
+    lock: &'a LoroMutex<Option<Transaction>>,
+) -> (LoroMutexGuard<'a, Option<Transaction>>, bool) {
+    let mut since = None;
+    loop {
+        let guard = lock.lock();
+        let foreign = guard
+            .as_ref()
+            .is_some_and(|t| t.has_foreign_rollback_scope());
+        if !foreign || cfg!(target_arch = "wasm32") {
+            return (guard, foreign);
+        }
+        let start = *since.get_or_insert_with(std::time::Instant::now);
+        let waited = start.elapsed();
+        if waited >= SCOPE_WAIT {
+            return (guard, true);
+        }
+        drop(guard);
+        std::thread::sleep((waited / 4).clamp(
             std::time::Duration::from_micros(50),
             std::time::Duration::from_millis(1),
-        )
-    })
+        ));
+    }
 }
 
 /// The error of a checked commit whose ops were committed or mixed with another thread's.
