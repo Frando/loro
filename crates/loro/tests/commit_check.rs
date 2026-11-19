@@ -127,23 +127,121 @@ fn scope_api_checks_then_commits_or_undoes() {
     assert!(doc.get_map("m").get("ok").is_some());
 }
 
-/// A commit inside the scope, on its own thread, is a bug: debug builds panic;
-/// otherwise it breaks the scope, which then fails and its ops stay.
+/// A commit inside the scope, on its own thread, is refused in every build: an
+/// explicit commit leaves the ops pending; import, snapshot export, checkout and
+/// undo fail; an update export exports the committed ops only. The scope stays
+/// intact and commits checked.
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "a commit inside a rollback scope")
-)]
-fn a_commit_inside_the_scope_breaks_it() {
+fn a_commit_inside_the_scope_is_refused() {
     let doc = LoroDoc::new();
     doc.set_peer_id(1).unwrap();
+    doc.get_map("m").insert("before", 1).unwrap();
+    doc.commit();
+    let mut undo = UndoManager::new(&doc);
+    doc.get_map("m").insert("u", 1).unwrap();
+    doc.commit();
+    let v1 = doc.state_frontiers();
     guard(&doc);
+    let other = LoroDoc::new();
+    other.get_map("o").insert("k", 1).unwrap();
+    let bytes = other.export(ExportMode::all_updates()).unwrap();
+
     let scope = doc.begin_checked().unwrap();
     doc.get_map("m").insert("x", 2).unwrap();
     doc.commit();
-    assert!(doc.check_checked(&scope, "app").is_err());
-    assert!(doc.end_checked(scope, "app", false).is_err());
+    assert_eq!(doc.get_pending_txn_len(), 1);
+    assert!(doc.import(&bytes).is_err());
+    assert!(doc.export(ExportMode::Snapshot).is_err());
+    assert!(doc.checkout(&v1).is_err());
+    assert!(undo.undo().is_err());
+    let peer = LoroDoc::new();
+    peer.import(&doc.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    assert!(peer.get_map("m").get("x").is_none());
+    assert_eq!(doc.get_pending_txn_len(), 1);
+
+    assert!(doc.check_checked(&scope, "app").unwrap());
+    doc.end_checked(scope, "app", true).unwrap();
+    assert_eq!(doc.get_pending_txn_len(), 0);
     assert!(doc.get_map("m").get("x").is_some());
+    // The import works again once the scope ended.
+    doc.import(&bytes).unwrap();
+}
+
+/// An implicit commit that cannot return an error panics inside a scope of its
+/// own thread, in release builds too; the ops are not committed.
+#[test]
+fn an_implicit_commit_inside_the_scope_panics() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    let vv = doc.oplog_vv();
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = doc.commit_checked("app", || -> Result<(), LoroError> {
+            doc.get_map("m").insert("x", 1)?;
+            let _ = doc.fork();
+            Ok(())
+        });
+    }));
+    assert!(out.is_err());
+    assert_eq!(doc.oplog_vv(), vv);
+    assert!(doc.get_map("m").get("x").is_none());
+}
+
+/// A scope continued on another thread (an `.await` inside it) fails closed:
+/// its check and its end fail there, and its ops are undone.
+#[test]
+fn a_scope_moved_to_another_thread_fails() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    guard(&doc);
+    let vv = doc.oplog_vv();
+    let scope = doc.begin_checked().unwrap();
+    doc.get_map("m").insert("x", 1).unwrap();
+    let moved = doc.clone();
+    std::thread::spawn(move || {
+        assert!(moved.check_checked(&scope, "app").is_err());
+        assert!(moved.end_checked(scope, "app", true).is_err());
+    })
+    .join()
+    .unwrap();
+    assert_eq!(doc.oplog_vv(), vv);
+    assert!(doc.get_map("m").get("x").is_none());
+    assert_eq!(doc.get_pending_txn_len(), 0);
+    doc.get_map("m").insert("y", 1).unwrap();
+    doc.commit();
+    assert_ne!(doc.oplog_vv(), vv);
+}
+
+/// Scopes begin and end on one thread while another exports updates: the
+/// export decides under one guard whether to commit, so it never waits for a
+/// scope, however long the scope runs.
+#[test]
+fn an_update_export_never_waits_for_a_scope() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    let held = std::time::Duration::from_millis(100);
+    let stop = Arc::new(AtomicBool::new(false));
+    let exporter = {
+        let (doc, stop) = (doc.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut slowest = std::time::Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let start = Instant::now();
+                doc.export(ExportMode::all_updates()).unwrap();
+                slowest = slowest.max(start.elapsed());
+            }
+            slowest
+        })
+    };
+    for i in 0..20 {
+        let scope = doc.begin_checked().unwrap();
+        doc.get_map("m").insert("k", i).unwrap();
+        std::thread::sleep(held);
+        doc.end_checked(scope, "app", true).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    let slowest = exporter.join().unwrap();
+    assert!(slowest < held / 2, "{slowest:?}");
 }
 
 /// Another thread that writes and commits while scopes run: its ops never join

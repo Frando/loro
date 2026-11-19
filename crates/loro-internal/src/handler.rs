@@ -5084,7 +5084,8 @@ fn with_txn<R>(doc: &LoroDoc, f: impl FnOnce(&mut Transaction) -> LoroResult<R>)
             #[cfg(loom)]
             loom::thread::yield_now();
             doc.try_start_auto_commit()?;
-            txn = doc.txn.lock();
+            // A scope of another thread may have begun since: wait for it too.
+            txn = crate::loro::wait_for_foreign_scope(&doc.txn).0;
         }
     }
 }

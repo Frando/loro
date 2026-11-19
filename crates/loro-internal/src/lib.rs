@@ -193,6 +193,10 @@ impl Drop for LoroDoc {
             {
                 return;
             }
+            // The ops of an unfinished checked commit are not committed.
+            if (self.txn.lock().as_ref()).is_some_and(|t| t.has_rollback_scope()) {
+                return;
+            }
             let _ = self.implicit_commit_then_stop();
         }
     }

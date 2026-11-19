@@ -676,6 +676,16 @@ impl Transaction {
         self.rollback_scope.is_some()
     }
 
+    /// The id of the rollback scope that runs in this txn.
+    pub(crate) fn rollback_scope_id(&self) -> Option<u64> {
+        self.rollback_scope.as_ref().map(|s| s.id)
+    }
+
+    /// Whether a rollback scope that this thread opened runs in this txn.
+    pub(crate) fn has_own_rollback_scope(&self) -> bool {
+        (self.rollback_scope.as_ref()).is_some_and(|s| s.thread == current_thread_mark())
+    }
+
     /// Whether a rollback scope that another thread opened runs in this txn.
     pub(crate) fn has_foreign_rollback_scope(&self) -> bool {
         (self.rollback_scope.as_ref()).is_some_and(|s| s.thread != current_thread_mark())
