@@ -2254,8 +2254,10 @@ impl LoroDoc {
         }
         // Commits the pending ops (after another thread's scope ended), then opens
         // the scope under the same guard: no other scope can begin in between.
+        // Like an implicit commit, it keeps the next commit's options (message,
+        // timestamp) of an empty txn for the scope's commit.
         let (options, guard) =
-            self.commit_internal(CommitOptions::new().immediate_renew(false), false);
+            self.commit_internal(CommitOptions::new().immediate_renew(false), true);
         let mut guard = guard.expect("a commit that does not renew returns its guard");
         if !self.can_edit() {
             drop(guard);

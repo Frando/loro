@@ -463,3 +463,18 @@ fn cost_per_commit() {
         "us per commit: plain {plain:.1}, scoped {scoped:.1}, checked {checked:.1}, refused {refused:.1}"
     );
 }
+
+/// The next commit's options set before a scope (a timestamp) are those of
+/// the scope's change: opening the scope keeps them.
+#[test]
+fn a_scope_keeps_the_next_commit_options() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    doc.set_next_commit_timestamp(1234);
+    let scope = doc.begin_checked().unwrap();
+    doc.get_map("m").insert("k", 1).unwrap();
+    assert!(doc.check_checked(&scope, "app").unwrap());
+    doc.end_checked(scope, "app", true).unwrap();
+    let change = doc.get_change(loro::ID::new(1, 0)).unwrap();
+    assert_eq!(change.timestamp, 1234);
+}
